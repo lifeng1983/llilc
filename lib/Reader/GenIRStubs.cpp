@@ -14,8 +14,14 @@
 ///
 //===----------------------------------------------------------------------===//
 
+#include "earlyincludes.h"
 #include "reader.h"
 #include <cstdarg>
+#include <cstdio>
+
+#ifdef _MSC_VER
+#define vsnprintf _vsnprintf
+#endif
 
 // Get the special block-start placekeeping node
 IRNode *fgNodeGetStartIRNode(FlowGraphNode *FgNode) { return (IRNode *)FgNode; }
@@ -74,9 +80,6 @@ void irNodeLabelSetMSILOffset(IRNode *Node, uint32_t LabelMSILOffset) {
   throw NotYetImplementedException("irNodeLabelSetMSILOffset");
 }
 
-// TODO: figure out how we're going to communicate this information.
-void irNodeBranchSetMSILOffset(IRNode *BranchNode, uint32_t Offset) { return; }
-
 void irNodeExceptSetMSILOffset(IRNode *BranchNode, uint32_t Offset) {
   throw NotYetImplementedException("irNodeExceptSetMSILOffset");
 }
@@ -88,9 +91,6 @@ void irNodeInsertBefore(IRNode *InsertionPointTuple, IRNode *NewNode) {
 void irNodeInsertAfter(IRNode *InsertionPointTuple, IRNode *NewNode) {
   throw NotYetImplementedException("irNodeInsertAfter");
 }
-
-// TODO: figure out how we're going to communicate this information.
-void irNodeSetRegion(IRNode *Node, EHRegion *Region) { return; }
 
 EHRegion *irNodeGetRegion(IRNode *Node) {
   throw NotYetImplementedException("irNodeGetRegion");
@@ -106,14 +106,6 @@ bool irNodeIsEHFlowAnnotation(IRNode *Node) {
 
 bool irNodeIsHandlerFlowAnnotation(IRNode *Node) {
   throw NotYetImplementedException("irNodeIsHandlerFlowAnnotation");
-}
-
-BranchList *branchListGetNext(BranchList *BranchList) {
-  throw NotYetImplementedException("branchListGetNext");
-}
-
-IRNode *branchListGetIRNode(BranchList *BranchList) {
-  throw NotYetImplementedException("branchListGetIRNode");
 }
 
 void ReaderBase::verifyNeedsVerification() { return; }
@@ -512,8 +504,13 @@ void ReaderBase::verGlobalError(const char *Message) { return; }
 int _cdecl dbPrint(const char *Format, ...) {
   va_list Args;
   va_start(Args, Format);
-  int NumChars = vfprintf(stderr, Format, Args);
+  const int BufferSize = 200;
+  char Buffer[BufferSize];
+  int NumChars = vsnprintf(Buffer, BufferSize, Format, Args);
   va_end(Args);
+  if (NumChars > 0) {
+    llvm::dbgs() << Buffer;
+  }
   return NumChars;
 }
 

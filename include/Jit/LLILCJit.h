@@ -17,14 +17,22 @@
 #define LLILC_JIT_H
 
 #include "Pal/LLILCPal.h"
-#include "options.h"
+#include "Reader/options.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
+#include "llvm/ExecutionEngine/RuntimeDyld.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/ThreadLocal.h"
+#include "llvm/ExecutionEngine/Orc/IRCompileLayer.h"
+#include "llvm/ExecutionEngine/Orc/NullResolver.h"
+#include "llvm/Config/config.h"
 
 class ABIInfo;
+class GcInfo;
 struct LLILCJitPerThreadState;
+namespace llvm {
+class EEMemoryManager;
+} // namespace llvm
 
 /// \brief This struct holds per-jit request state.
 ///
@@ -62,13 +70,11 @@ struct LLILCJitContext {
   std::unique_ptr<llvm::Module>
   getModuleForMethod(CORINFO_METHOD_INFO *MethodInfo);
 
-  /// Write an informational message about this jit request to LLVM's dbgs().
-  void outputDebugMethodName();
-
 public:
   /// \name CoreCLR EE information
   //@{
   ICorJitInfo *JitInfo;            ///< EE callback interface.
+  ICorJitHost *JitHost;            ///< EE Host Interface
   CORINFO_METHOD_INFO *MethodInfo; ///< Description of method to jit.
   uint32_t Flags;                  ///< Flags controlling jit behavior.
   CORINFO_EE_INFO EEInfo;          ///< Information about internal EE data.
@@ -79,8 +85,11 @@ public:
   //@{
   llvm::LLVMContext *LLVMContext; ///< LLVM context for types and similar.
   llvm::Module *CurrentModule;    ///< Module holding LLVM IR.
-  llvm::ExecutionEngine *EE;      ///< MCJIT execution engine.
+  llvm::TargetMachine *TM;        ///< Target characteristics
   bool HasLoadedBitCode;          ///< Flag for side-loaded LLVM IR.
+  llvm::StringMap<uint64_t> NameToHandleMap; ///< Map from global object names
+                                             ///< to the corresponding CLR
+                                             ///< handles.
   //@}
 
   /// \name ABI information
@@ -96,15 +105,19 @@ public:
 
   /// \name Per invocation JIT Options
   //@{
-  Options Options;
+  ::Options *Options;
   //@}
 
   /// \name Jit output sizes
   //@{
-  uint32_t HotCodeSize = 0;      ///< Size of hot code section in bytes.
-  uint32_t ColdCodeSize = 0;     ///< Size of cold code section in bytes.
-  uint32_t ReadOnlyDataSize = 0; ///< Size of readonly data ref'd from code.
+  uintptr_t HotCodeSize = 0;      ///< Size of hot code section in bytes.
+  uintptr_t ColdCodeSize = 0;     ///< Size of cold code section in bytes.
+  uintptr_t ReadOnlyDataSize = 0; ///< Size of readonly data ref'd from code.
+  uintptr_t StackMapSize = 0;     ///< Size of readonly Stackmap section.
   //@}
+
+  /// \name GC Information
+  ::GcInfo *GcInfo; ///< GcInfo for functions in CurrentModule
 };
 
 /// \brief This struct holds per-thread Jit state.
@@ -119,8 +132,9 @@ struct LLILCJitPerThreadState {
 public:
   /// Construct a new state.
   LLILCJitPerThreadState()
-      : LLVMContext(), ClassTypeMap(), ReverseClassTypeMap(), BoxedTypeMap(),
-        ArrayTypeMap(), FieldIndexMap(), JitContext(nullptr) {}
+      : LLVMContext(), JitContext(nullptr), ClassTypeMap(),
+        ReverseClassTypeMap(), BoxedTypeMap(), ArrayTypeMap(), FieldIndexMap() {
+  }
 
   /// Each thread maintains its own \p LLVMContext. This is where
   /// LLVM keeps definitions of types and similar constructs.
@@ -143,15 +157,44 @@ public:
   /// them.
   ///
   /// \note Arrays can't be looked up via the \p ClassTypeMap. Instead they
-  /// are looked up via element type, element handle, and array rank.
-  std::map<std::tuple<CorInfoType, CORINFO_CLASS_HANDLE, uint32_t>,
-           llvm::Type *> ArrayTypeMap;
+  /// are looked up via element type, element handle, array rank, and whether
+  /// this array is a vector (single-dimensional array with zero lower bound).
+  std::map<std::tuple<CorInfoType, CORINFO_CLASS_HANDLE, uint32_t, bool>,
+           llvm::Type *>
+      ArrayTypeMap;
 
   /// \brief Map from a field handle to the index of that field in the overall
   /// layout of the enclosing class.
   ///
   /// Used to build struct GEP instructions in LLVM IR for field accesses.
   std::map<CORINFO_FIELD_HANDLE, uint32_t> FieldIndexMap;
+};
+
+/// \brief Stub \p SymbolResolver that tells dynamic linker not to apply
+/// relocations for external symbols we know about.
+///
+/// The ObjectLinkingLayer takes a SymbolResolver ctor parameter.
+class EESymbolResolver : public llvm::RuntimeDyld::SymbolResolver {
+public:
+  EESymbolResolver(llvm::StringMap<uint64_t> *NameToHandleMap) {
+    this->NameToHandleMap = NameToHandleMap;
+  }
+
+  llvm::RuntimeDyld::SymbolInfo findSymbol(const std::string &Name) final {
+    // Address UINT64_MAX means that we will resolve relocations for this symbol
+    // manually and the dynamic linker will skip relocation resolution for this
+    // symbol.
+    return llvm::RuntimeDyld::SymbolInfo(UINT64_MAX,
+                                         llvm::JITSymbolFlags::None);
+  }
+
+  llvm::RuntimeDyld::SymbolInfo
+  findSymbolInLogicalDylib(const std::string &Name) final {
+    llvm_unreachable("Unexpected request to resolve a common symbol.");
+  }
+
+private:
+  llvm::StringMap<uint64_t> *NameToHandleMap;
 };
 
 /// \brief The Jit interface to the CoreCLR EE.
@@ -224,25 +267,23 @@ public:
   ///        instances this is.
   static void signalHandler(void *Cookie);
 
+  /// Return SIMD generic vector length if LLILC is primary JIT.
+  unsigned getMaxIntrinsicSIMDVectorLength(DWORD CpuCompileFlags) override;
+
 private:
   /// Convert a method into LLVM IR.
   /// \param JitContext Context record for the method's jit request.
+  /// \param ContainsUnmanagedCall [out] Indicates whether the method read
+  ///                                    contains a call to unmanaged code.
   /// \returns \p true if the conversion was successful.
-  bool readMethod(LLILCJitContext *JitContext);
-
-  /// Output GC info to the EE.
-  /// \param JitContext Context record for the method's jit request.
-  /// \returns \p true if GC info was successfully reported.
-  bool outputGCInfo(LLILCJitContext *JitContext);
+  bool readMethod(LLILCJitContext *JitContext, bool &ContainsUnmanagedCall);
 
 public:
   /// A pointer to the singleton jit instance.
   static LLILCJit *TheJit;
 
-  /// \name CoreCLR GC information
-  //@{
-  bool ShouldUseConservativeGC; ///< Whether the GC is conservative/precise
-  //@}
+  /// A pointer to the singleton jit-host instance.
+  static ICorJitHost *TheJitHost;
 
 private:
   /// Thread local storage for the jit's per-thread state.

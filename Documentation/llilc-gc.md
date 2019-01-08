@@ -38,8 +38,10 @@ For the full CoreCLR GC, a JIT has several responsibilities:
 8.  Fill in a GC Info object describing the above information for use by
     the runtime. Note that in the CoreCLR the reporting format is architecture
     dependent and may require various encoding techniques.
+9.  Ensure that correct transitions are made between managed and unmanaged
+    (i.e. GC-unaware) code.
 
-In conservative mode none of these apply, but:
+In conservative mode only 9. applies, but:
 
 1.  The JIT must ensure that at a safepoint, each live object with a root in
     the current stack frame is referenced by at least one object or interior
@@ -117,6 +119,11 @@ address space with some distinguishing GC attribute. Then identifying the set
 of necessary safepoints and liveness analysis could drive wiring up the
 SSA uses and definitions. We have adopted this address space convention in
 LLILC.
+
+`Statepoints` also support the notion of statepoints which are transitions
+between code that uses different GC modes ("GC transitions").  LLILC can
+(and does) make use of GC transitions to support calls from managed to
+unmanaged code.
 
 ## Open Issues - Correctness
 
@@ -297,18 +304,19 @@ of `RBX` is unnecessary.
         restore RBX          // so this restore is not redundant
         ret
 
-### Callee-Saves and PInvokes
+### Callee-Saves and GC transitions
 
-In methods that might PInvoke (or call into native code), the compiler
-must ensure that no callee saves contain GC references at safepoint PInvoke
-call sites. Whenever a native method is called the compiler must arrange to
-spill all callee saves to known locations so that they can be found and
-(if the gc is relocating) reliably updated.
+In methods that might call into unmanaged code, the compiler must ensure
+that either
+a. no callee saves contain GC references at unmanaged call sites, or
+b. any callee saves that do contain GC references at such call sites are
+   spilled to known locations that can be found and (if the gc is
+   relocating) reliably updated.
 
 Note this might mean spilling the callee save even if it's not used in the
 method, since the callee has no way of knowing if that register contains
-a GC pointer or not (preferably, shrink wrapping the spill so it happens only
-if the PInvoke calls are actually going to happen).
+a GC pointer or not (preferably shrink wrapping the spill so it happens only
+if the unmanaged calls are actually going to happen).
 
 ### Stack Layout
 
@@ -448,6 +456,40 @@ Based on our experiences with Statepoint V1 we'll likely want to work with
 the community to enhance the `Statepoint` work. The specifics here will
 depend on what we've learned and what problems we encounter.
 
+### Generating GC Tables
+
+CoreCLR requires the generation of GC Tables that contain pointer 
+liveness information for each method. To achieve this, we read 
+the liveness information from the `__llvm.stackmaps` section, and 
+translate it to the CoreCLR format. We obtain the information by 
+post-processing LLVM generated binary, rather than adding a new 
+StackMap generator (for CoreCLR format) to LLVM itself. 
+While this involves a two step translation, it helps avoid:
+* Compatibility conflicts because of LLVM core having to change 
+  whenever there is a change in CoreCLR.
+* Bugs because of changes not correctly propagated to multiple 
+  stack-map generators in LLVM.
+
+Generating GC Tables involves the following steps:
+
+1. Enable StackMap section generation for COFF in LLVM.
+2. Parse the `__llvm.stackmaps` section.
+3. Collect certain information about the stack frame 
+   (ex: which of the callee save registers are saved) not available
+   in the StackMap section by parsing other sections, if necessary.
+4. Encode information using CoreCLR's GCInfo Encoder
+  * Report each call-site (GC safepoint).
+  * Assign slots IDs for each unique register and stack locations.
+  * For each slot, report liveness based on the location records 
+    in `__llvm.stackmaps` section.
+
+CoreCLR permits reportng certain slots as "untracked" GC-pointers,
+for stackmap-size reduction or throughput reasons. 
+However, LLVM currently does not support untracked reporting -- 
+stack-locations cannot be assumed to remain live through entire function, 
+due to transformations like stack coalescing. Therefore, LLILC will report
+the liveness of all slots as tracked pointers.
+
 ## Summary
 
 The requirements imposed on a code generator by the CoreCLR present new
@@ -539,5 +581,25 @@ A *native* (or *unmanaged*) method is a code sequence that is not aware of
 the special requirements for GC reporting. Typically these are assembly or
 C++ methods or similar.
 
-A *PInvoke* (Platform Invoke) is a call to a native method from Jitted code.
-A *Reverse PInvoke* is a call to a Jitted method from native code.
+A *PInvoke* (Platform Invoke) is a call to native code from a managed method.
+A *Reverse PInvoke* is a call to a managed method from native code.
+
+## Staging Plan
+
+No.  | Implementation | Testing | Issue | Status 
+---- |--------------- | --------| ------| -------  
+1 | Insert GC Safepoints: Run the PlaceSafepoints and RewriteSafepointsForGC phases before Code generation, and ensure that statepoints are inserted and lowered correctly | LLILC tests pass with Conservative GC | [32](https://github.com/dotnet/llilc/issues/32) | Completed 
+2 |	Bring GCInfo library to LLILC: Use the GCInfo library to encode Function size correctly; no live pointers reported at GC-safe points | LLILC tests pass with Conservative GC  | [30](https://github.com/dotnet/llilc/issues/30) | Completed
+3 | Report GC liveness: Encode GC pointer liveness information in the CLR format using the GC-Encoding library | A few functions compiled by LLILC with correct GCInfo | [31](https://github.com/dotnet/llilc/issues/31) | Completed
+4 | Test Pass |  CoreCLR tests pass with Precise GC | [670](https://github.com/dotnet/llilc/issues/670) | Completed
+5 | Add GC-specific stress tests| All existing and new tests pass | [696](https://github.com/dotnet/llilc/issues/696) | In Progress | 
+6 | GC Stress testing | Run the LLILC tests in GCStress mode; some GCStress testing running regularly in the lab | |
+7 | Special reporting for pinned pointers | Code with pinned pointers handled by LLILC | [29](https://github.com/dotnet/llilc/issues/29) | Completed |
+8 | Support aggregates containing GC pointers  | Code with GC-aggregates handled by LLILC | [33](https://github.com/dotnet/llilc/issues/33) | Completed |
+9 | Fully-Interruptible code: Investigate whether fully interruptible code should be supported | Test and GCStress Pass | [473](https://github.com/dotnet/llilc/issues/473) | |
+10 | Lower Write barriers to Calls late | Test and GCStress Pass | [471](https://github.com/dotnet/llilc/issues/471) | | 
+11 | Place Safepoint-polls only where necessary for CoreCLR runtime | Test and GCStress Pass | [425](https://github.com/dotnet/llilc/issues/425) | |
+12 | Track GC-pointers in registers | Test and GCStress Pass | [474](https://github.com/dotnet/llilc/issues/474) | | 
+13 | Implement GC Checker | Test and GCStress Pass | [34](https://github.com/dotnet/llilc/issues/34) | |
+14 | Identify Object and Managed pointers differently| Test and GCStress Pass | [28](https://github.com/dotnet/llilc/issues/28) | |
+15 | Implement necessary support to enable Precise GC when LLVM optimizations are turned on for LLILC | Test and GCStress Pass in an optimized LLILC build | | |

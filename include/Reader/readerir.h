@@ -24,6 +24,10 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/CallSite.h"
+#include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "GcInfo.h"
 #include "reader.h"
 #include "abi.h"
 #include "abisignature.h"
@@ -45,8 +49,9 @@ public:
   FlowGraphNodeInfo() {
     StartMSILOffset = 0;
     EndMSILOffset = 0;
-    IsVisited = false;
+    Region = nullptr;
     TheReaderStack = nullptr;
+    IsVisited = false;
     PropagatesOperandStack = true;
   };
 
@@ -58,12 +63,15 @@ public:
   /// Block.
   uint32_t EndMSILOffset;
 
-  /// In algorithms traversing the flow graph, used to track which basic blocks
-  /// have been visited.
-  bool IsVisited;
+  /// Region containing this block
+  EHRegion *Region;
 
   /// Used to track what is on the operand stack on entry to the basic block.
   ReaderStack *TheReaderStack;
+
+  /// In algorithms traversing the flow graph, used to track which basic blocks
+  /// have been visited.
+  bool IsVisited;
 
   /// true iff this basic block uses an operand stack and propagates it to the
   /// block's successors when it's not empty on exit.
@@ -79,64 +87,23 @@ public:
 /// llvm::Value.
 class IRNode : public llvm::Value {};
 
-/// \brief Abstract class representing a list of flow graph edges.
-///
-/// The list acts like an iterator which has a current position from which
-/// source and sink nodes can be found.
-class FlowGraphEdgeList {
-public:
-  /// Constructor
-  FlowGraphEdgeList(){};
-
-  /// Move the current location in the flow graph edge list to the next edge.
-  virtual void moveNext() = 0;
-
-  /// \return The sink (aka target or destination) node of the current edge.
-  virtual FlowGraphNode *getSink() = 0;
-
-  /// \return The source (aka From) node of the current edge.
-  virtual FlowGraphNode *getSource() = 0;
-};
-
-/// \brief A list of predecessor edges of a given flow graph node.
-///
-/// This is used for iterating over the predecessors of a flow graph node.
-/// After creating the predecessor edge list the getSource method is used
-/// to get the first predecessor (if any). As long as the result of getSource()
-/// is non-null, the moveNext() method may be used to advance to the next
-/// predecessor edge. When getSource() returns null there are no more
-/// predecessor edges (or predecessors).
-/// \invariant The current edge iterator either points to a real edge or else
-/// equals the end iterator meaning the list has been exhausted.
-class FlowGraphPredecessorEdgeList : public FlowGraphEdgeList {
+/// \brief An iterator for the predecessor edges of a given flow graph node.
+class FlowGraphPredecessorEdgeIteratorImpl : public FlowGraphEdgeIteratorImpl {
 public:
   /// Construct a flow graph edge list for iterating over the predecessors
   /// of the \p Fg node.
   /// \param Fg The node whose predecessors are desired.
-  /// \pre \p Fg != nullptr.
-  /// \post **this** is a predecessor edge list representing the predecessors
-  /// of \p Fg.
-  FlowGraphPredecessorEdgeList(FlowGraphNode *Fg)
-      : FlowGraphEdgeList(), PredIterator(Fg), PredIteratorEnd(Fg, true) {}
+  FlowGraphPredecessorEdgeIteratorImpl(FlowGraphNode *Fg)
+      : FlowGraphEdgeIteratorImpl(), PredIterator(Fg),
+        PredIteratorEnd(Fg, true) {}
 
-  /// Move the current location in the flow graph edge list to the next edge.
-  /// \pre The current edge has not reached the end of the edge list.
-  /// \post The current edge has been advanced to the next, or has possibly
-  /// reached the end iterator (meaning no more predecessors).
+  bool isEnd() override { return PredIterator == PredIteratorEnd; }
   void moveNext() override { PredIterator++; }
-
-  /// \return The sink of the current edge which will be \p Fg node.
-  /// \pre The current edge has not reached the end of the edge list.
   FlowGraphNode *getSink() override {
     return (FlowGraphNode *)PredIterator.getUse().get();
   }
-
-  /// \return The source of the current edge which will be one of the
-  /// predecessors of the \p Fg node, unless the list has been exhausted in
-  /// which case return nullptr.
   FlowGraphNode *getSource() override {
-    return (PredIterator == PredIteratorEnd) ? nullptr
-                                             : (FlowGraphNode *)*PredIterator;
+    return (isEnd()) ? nullptr : (FlowGraphNode *)*PredIterator;
   }
 
 private:
@@ -144,51 +111,23 @@ private:
   llvm::pred_iterator PredIteratorEnd;
 };
 
-/// \brief A list of successor edges of a given flow graph node.
-///
-/// This is used for iterating over the successors of a flow graph node.
-/// After creating the successor edge list the getSink method is used
-/// to get the first successor (if any). As long as the result of getSink()
-/// is non-null, the moveNext() method may be used to advance to the next
-/// successor edge. When getSink() returns null there are no more
-/// successor edges (or successors).
-/// \invariant The current edge iterator either points to a real edge or else
-/// equals the end iterator meaning the list has been exhausted.
-class FlowGraphSuccessorEdgeList : public FlowGraphEdgeList {
+/// \brief An iterator for successor edges of a given flow graph node.
+class FlowGraphSuccessorEdgeIteratorImpl : public FlowGraphEdgeIteratorImpl {
 public:
   /// Construct a flow graph edge list for iterating over the successors
   /// of the \p Fg node.
   /// \param Fg The node whose successors are desired.
-  /// \pre \p Fg != nullptr.
-  /// \post **this** is a successor edge list representing the successors
-  /// of \p Fg.
-  FlowGraphSuccessorEdgeList(FlowGraphNode *Fg)
-      : FlowGraphEdgeList(), SuccIterator(Fg->getTerminator()),
-        SuccIteratorEnd(Fg->getTerminator(), true) {}
+  FlowGraphSuccessorEdgeIteratorImpl(FlowGraphNode *Fg, EHRegion *Region);
 
-  /// Move the current location in the flow graph edge list to the next edge.
-  /// \pre The current edge has not reached the end of the edge list.
-  /// \post The current edge has been advanced to the next, or has possibly
-  /// reached the end iterator (meaning no more successors).
-  void moveNext() override { SuccIterator++; }
-
-  /// \return The sink of the current edge which will be one of the successors
-  /// of the \p Fg node, unless the list has been exhausted in which case
-  /// return nullptr.
-  FlowGraphNode *getSink() override {
-    return (SuccIterator == SuccIteratorEnd) ? nullptr
-                                             : (FlowGraphNode *)*SuccIterator;
-  }
-
-  /// \return The source of the current edge which will be \p Fg node.
-  /// \pre The current edge has not reached the end of the edge list.
-  FlowGraphNode *getSource() override {
-    return (FlowGraphNode *)SuccIterator.getSource();
-  }
+  bool isEnd() override;
+  void moveNext() override;
+  FlowGraphNode *getSink() override;
+  FlowGraphNode *getSource() override;
 
 private:
   llvm::succ_iterator SuccIterator;
   llvm::succ_iterator SuccIteratorEnd;
+  llvm::BasicBlock *NominalSucc;
 };
 
 /// \brief A stack of IRNode pointers representing the MSIL operand stack.
@@ -247,21 +186,20 @@ class GenIR : public ReaderBase {
   friend class ABIMethodSignature;
 
 public:
-  GenIR(LLILCJitContext *JitContext,
-        std::map<CORINFO_CLASS_HANDLE, llvm::Type *> *ClassTypeMap,
-        std::map<llvm::Type *, CORINFO_CLASS_HANDLE> *ReverseClassTypeMap,
-        std::map<CORINFO_CLASS_HANDLE, llvm::Type *> *BoxedTypeMap,
-        std::map<std::tuple<CorInfoType, CORINFO_CLASS_HANDLE, uint32_t>,
-                 llvm::Type *> *ArrayTypeMap,
-        std::map<CORINFO_FIELD_HANDLE, uint32_t> *FieldIndexMap)
+  GenIR(LLILCJitContext *JitContext)
       : ReaderBase(JitContext->JitInfo, JitContext->MethodInfo,
-                   JitContext->Flags) {
+                   JitContext->Flags),
+        UnmanagedCallFrame(nullptr), ThreadPointer(nullptr),
+        BuiltinObjectType(nullptr), ElementToArrayTypeMap() {
     this->JitContext = JitContext;
-    this->ClassTypeMap = ClassTypeMap;
-    this->ReverseClassTypeMap = ReverseClassTypeMap;
-    this->BoxedTypeMap = BoxedTypeMap;
-    this->ArrayTypeMap = ArrayTypeMap;
-    this->FieldIndexMap = FieldIndexMap;
+    this->NameToHandleMap = &JitContext->NameToHandleMap;
+    // Cache a few things from the per-thread state.
+    LLILCJitPerThreadState *State = JitContext->State;
+    this->ClassTypeMap = &State->ClassTypeMap;
+    this->ReverseClassTypeMap = &State->ReverseClassTypeMap;
+    this->BoxedTypeMap = &State->BoxedTypeMap;
+    this->ArrayTypeMap = &State->ArrayTypeMap;
+    this->FieldIndexMap = &State->FieldIndexMap;
   }
 
   static bool isValidStackType(IRNode *Node);
@@ -304,15 +242,27 @@ public:
   IRNode *call(ReaderBaseNS::CallOpcode Opcode, mdToken Token,
                mdToken ConstraintTypeRef, mdToken LoadFtnToken,
                bool HasReadOnlyPrefix, bool HasTailCallPrefix,
-               bool IsUnmarkedTailCall, uint32_t CurrOffset,
-               bool *RecursiveTailCall) override;
+               bool IsUnmarkedTailCall, uint32_t CurrOffset) override;
 
   IRNode *castOp(CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *ObjRefNode,
                  CorInfoHelpFunc HelperId) override;
 
-  IRNode *ckFinite(IRNode *Arg1) override {
-    throw NotYetImplementedException("ckFinite");
-  };
+  IRNode *ckFinite(IRNode *Arg1) override;
+
+  /// \brief Modify comparison arguments, if needed, to have equal types.
+  ///
+  /// LLVM comparisons require that the operands have the same type
+  /// whereas MSIL operands may have different type, subject to
+  /// the conditions in the ECMA spec, partition III, table 4,
+  /// except we relax these conditions somewhat by allowing comparison
+  /// of int64 with int32 or native int. Promote the arguments
+  /// as needed to achieve type equality.
+  ///
+  /// \param [in,out] Arg1 Pointer to first argument.
+  /// \param [in,out] Arg2 Pointer to second argument.
+  /// \returns True if the comparison is a floating comparison.
+  bool prepareArgsForCompare(IRNode *&Arg1, IRNode *&Arg2);
+
   IRNode *cmp(ReaderBaseNS::CmpOpcode Opode, IRNode *Arg1,
               IRNode *Arg2) override;
   void condBranch(ReaderBaseNS::CondBranchOpcode Opcode, IRNode *Arg1,
@@ -320,15 +270,18 @@ public:
   IRNode *conv(ReaderBaseNS::ConvOpcode Opcode, IRNode *Source) override;
 
   void dup(IRNode *Opr, IRNode **Result1, IRNode **Result2) override;
-  void endFilter(IRNode *Arg1) override {
-    throw NotYetImplementedException("endFilter");
-  };
+  void endFilter(IRNode *Arg1) override;
 
+  FlowGraphEdgeIterator fgNodeGetSuccessors(FlowGraphNode *FgNode) override;
+  FlowGraphEdgeIterator fgNodeGetPredecessors(FlowGraphNode *FgNode) override;
   FlowGraphNode *fgNodeGetNext(FlowGraphNode *FgNode) override;
   uint32_t fgNodeGetStartMSILOffset(FlowGraphNode *Fg) override;
   void fgNodeSetStartMSILOffset(FlowGraphNode *Fg, uint32_t Offset) override;
   uint32_t fgNodeGetEndMSILOffset(FlowGraphNode *Fg) override;
   void fgNodeSetEndMSILOffset(FlowGraphNode *FgNode, uint32_t Offset) override;
+  EHRegion *fgNodeGetRegion(FlowGraphNode *FgNode) override;
+  void fgNodeSetRegion(FlowGraphNode *FgNode, EHRegion *EhRegion) override;
+  void fgNodeChangeRegion(FlowGraphNode *FgNode, EHRegion *EhRegion) override;
 
   bool fgNodeIsVisited(FlowGraphNode *FgNode) override;
   void fgNodeSetVisited(FlowGraphNode *FgNode, bool Visited) override;
@@ -337,10 +290,7 @@ public:
 
   IRNode *getStaticFieldAddress(CORINFO_RESOLVED_TOKEN *ResolvedToken) override;
 
-  void jmp(ReaderBaseNS::CallOpcode Opcode, mdToken Token, bool HasThis,
-           bool HasVarArg) override {
-    throw NotYetImplementedException("jmp");
-  };
+  void jmp(ReaderBaseNS::CallOpcode Opcode, mdToken Token) override;
 
   virtual uint32_t updateLeaveOffset(uint32_t LeaveOffset, uint32_t NextOffset,
                                      FlowGraphNode *LeaveBlock,
@@ -348,8 +298,7 @@ public:
   uint32_t updateLeaveOffset(EHRegion *Region, uint32_t LeaveOffset,
                              uint32_t NextOffset, FlowGraphNode *LeaveBlock,
                              uint32_t TargetOffset, bool &IsInHandler);
-  void leave(uint32_t TargetOffset, bool IsNonLocal,
-             bool EndsWithNonLocalGoto) override;
+  void leave(uint32_t TargetOffset) override;
   IRNode *loadArg(uint32_t ArgOrdinal, bool IsJmp) override;
   IRNode *loadLocal(uint32_t ArgOrdinal) override;
   IRNode *loadArgAddress(uint32_t ArgOrdinal) override;
@@ -368,33 +317,26 @@ public:
                     ReaderAlignType Alignment, bool IsVolatile) override;
 
   IRNode *loadNull() override;
-  IRNode *localAlloc(IRNode *Arg, bool ZeroInit) override {
-    throw NotYetImplementedException("localAlloc");
-  };
+  IRNode *localAlloc(IRNode *Arg, bool ZeroInit) override;
   IRNode *loadFieldAddress(CORINFO_RESOLVED_TOKEN *ResolvedToken,
                            IRNode *Obj) override;
 
   IRNode *loadLen(IRNode *Array, bool ArrayMayBeNull = true) override;
 
-  bool arrayAddress(CORINFO_SIG_INFO *Sig, IRNode **RetVal) override {
-    throw NotYetImplementedException("arrayAddress");
-  };
+  bool arrayAddress(CORINFO_SIG_INFO *Sig, IRNode **RetVal) override;
+
   IRNode *loadStringLen(IRNode *Arg1) override;
 
   IRNode *getTypeFromHandle(IRNode *HandleNode) override;
 
-  IRNode *getValueFromRuntimeHandle(IRNode *Arg1) override {
-    throw NotYetImplementedException("getValueFromRuntimeHandle");
-  };
+  IRNode *getValueFromRuntimeHandle(IRNode *Arg1) override;
+
   IRNode *arrayGetDimLength(IRNode *Arg1, IRNode *Arg2,
-                            CORINFO_CALL_INFO *CallInfo) override {
-    throw NotYetImplementedException("arrayGetDimLength");
-  };
+                            CORINFO_CALL_INFO *CallInfo) override;
 
   IRNode *loadAndBox(CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *Addr,
-                     ReaderAlignType AlignmentPrefix) override {
-    throw NotYetImplementedException("loadAndBox");
-  };
+                     ReaderAlignType AlignmentPrefix) override;
+
   IRNode *convertHandle(IRNode *RuntimeTokenNode, CorInfoHelpFunc HelperID,
                         CORINFO_CLASS_HANDLE ClassHandle) override;
   void
@@ -413,6 +355,10 @@ public:
   IRNode *loadVirtFunc(IRNode *Arg1, CORINFO_RESOLVED_TOKEN *ResolvedToken,
                        CORINFO_CALL_INFO *CallInfo) override;
 
+  IRNode *getReadyToRunVirtFuncPtr(IRNode *Arg1,
+                                   CORINFO_RESOLVED_TOKEN *ResolvedToken,
+                                   CORINFO_CALL_INFO *CallInfo) override;
+
   IRNode *loadPrimitiveType(IRNode *Addr, CorInfoType CorInfoType,
                             ReaderAlignType Alignment, bool IsVolatile,
                             bool IsInterfConst,
@@ -420,23 +366,38 @@ public:
 
   IRNode *loadNonPrimitiveObj(IRNode *Addr, CORINFO_CLASS_HANDLE ClassHandle,
                               ReaderAlignType Alignment, bool IsVolatile,
-                              bool AddressMayBeNull = true) override {
-    throw NotYetImplementedException("loadNonPrimitiveObj");
-  };
+                              bool AddressMayBeNull = true) override;
+
+  /// \brief Load a non-primitive object (i.e., a struct).
+  ///
+  /// \param StructTy Type of the struct.
+  /// \param Address Address of the struct.
+  /// \param Alignment Alignment of the load.
+  /// \param IsVolatile true iff this is a volatile load.
+  /// \param AddressMayBeNull true iff Address may be null.
+  ///
+  /// \returns Node representing loaded struct.
+  IRNode *loadNonPrimitiveObj(llvm::StructType *StructTy, IRNode *Address,
+                              ReaderAlignType Alignment, bool IsVolatile,
+                              bool AddressMayBeNull = true);
+
+  IRNode *loadNonPrimitiveObjNonNull(llvm::StructType *StructTy,
+                                     IRNode *Address, ReaderAlignType Alignment,
+                                     bool IsVolatile) {
+    return loadNonPrimitiveObj(StructTy, Address, Alignment, IsVolatile, false);
+  }
+
   IRNode *makeRefAny(CORINFO_RESOLVED_TOKEN *ResolvedToken,
-                     IRNode *Object) override {
-    throw NotYetImplementedException("makeRefAny");
-  };
+                     IRNode *Object) override;
   IRNode *newArr(CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *Arg1) override;
   IRNode *newObj(mdToken Token, mdToken LoadFtnToken,
                  uint32_t CurrOffset) override;
   void pop(IRNode *Opr) override;
-  IRNode *refAnyType(IRNode *Arg1) override {
-    throw NotYetImplementedException("refAnyType");
-  };
 
-  void rethrow() override { throw NotYetImplementedException("rethrow"); };
-  void returnOpcode(IRNode *Opr, bool SynchronousMethod) override;
+  IRNode *refAnyType(IRNode *Arg1) override;
+
+  void rethrow() override;
+  void returnOpcode(IRNode *Opr, bool IsSynchronizedMethod) override;
   IRNode *shift(ReaderBaseNS::ShiftOpcode Opcode, IRNode *ShiftAmount,
                 IRNode *ShiftOperand) override;
   IRNode *sizeofOpcode(CORINFO_RESOLVED_TOKEN *ResolvedToken) override;
@@ -454,27 +415,27 @@ public:
                           ReaderAlignType Alignment, bool IsVolatile,
                           bool AddressMayBeNull = true) override;
 
+  void storeNonPrimitiveType(IRNode *Value, IRNode *Addr,
+                             CORINFO_CLASS_HANDLE Class,
+                             ReaderAlignType Alignment, bool IsVolatile,
+                             CORINFO_RESOLVED_TOKEN *ResolvedToken,
+                             bool IsField) override;
+
   void storeLocal(uint32_t LocOrdinal, IRNode *Arg1, ReaderAlignType Alignment,
                   bool IsVolatile) override;
   void storeStaticField(CORINFO_RESOLVED_TOKEN *FieldToken,
                         IRNode *ValueToStore, bool IsVolatile) override;
 
   IRNode *stringGetChar(IRNode *Arg1, IRNode *Arg2) override;
+  bool sqrt(IRNode *Argument, IRNode **Result) override;
 
-  bool sqrt(IRNode *Arg1, IRNode **RetVal) override {
-    throw NotYetImplementedException("sqrt");
-  };
-
-  // The callTarget node is only required on IA64.
   bool interlockedIntrinsicBinOp(IRNode *Arg1, IRNode *Arg2, IRNode **RetVal,
-                                 CorInfoIntrinsics IntrinsicID) override {
-    throw NotYetImplementedException("interlockedIntrinsicBinOp");
-  };
-  bool interlockedCmpXchg(IRNode *Arg1, IRNode *Arg2, IRNode *Arg3,
-                          IRNode **RetVal,
-                          CorInfoIntrinsics IntrinsicID) override {
-    throw NotYetImplementedException("interlockedCmpXchg");
-  };
+                                 CorInfoIntrinsics IntrinsicID) override;
+
+  bool interlockedCmpXchg(IRNode *Destination, IRNode *Exchange,
+                          IRNode *Comparand, IRNode **Result,
+                          CorInfoIntrinsics IntrinsicID) override;
+
   bool memoryBarrier() override;
 
   void switchOpcode(IRNode *Opr) override;
@@ -505,13 +466,16 @@ public:
   methodNeedsToKeepAliveGenericsContext(bool KeepGenericsCtxtAlive) override;
 
   // Called to instantiate an empty reader stack.
-  ReaderStack *createStack(uint32_t MaxStack, ReaderBase *Reader) override;
+  ReaderStack *createStack() override;
 
   // Called when reader begins processing method.
   void readerPrePass(uint8_t *Buf, uint32_t NumBytes) override;
 
   // Called between building the flow graph and inserting the IR
   void readerMiddlePass(void) override;
+
+  // Called after reading all MSIL, before removing unreachable blocks
+  void readerPostVisit() override;
 
   // Called when reader has finished processing method.
   void readerPostPass(bool IsImportOnly) override;
@@ -525,7 +489,6 @@ public:
   // Used to maintain operand stack.
   void maintainOperandStack(FlowGraphNode *CurrentBlock) override;
   void assignToSuccessorStackNode(FlowGraphNode *, IRNode *Dst, IRNode *Src,
-
                                   bool *IsMultiByteAssign) override {
     throw NotYetImplementedException("assignToSuccessorStackNode");
   };
@@ -554,6 +517,10 @@ public:
 
   EHRegion *rgnAllocateRegion() override;
   EHRegionList *rgnAllocateRegionList() override;
+  void setDebugLocation(uint32_t CurrOffset, bool IsCall) override;
+  llvm::DISubroutineType *createFunctionType(llvm::Function *F,
+                                             llvm::DIFile *Unit);
+  llvm::DIType *convertType(llvm::Type *Ty);
 
   //
   // REQUIRED Flow and Region Graph Manipulation Routines
@@ -564,19 +531,23 @@ public:
   FlowGraphNode *fgGetTailBlock(void) override;
   FlowGraphNode *fgNodeGetIDom(FlowGraphNode *Fg) override;
 
+  void fgEnterRegion(EHRegion *Region) override;
+
+  /// Make an EH pad suitable as the head of the given handler.
+  ///
+  /// \param Handler       Catch/Finally/Fault/Filter region we need to
+  ///                      build an EH pad for.
+  /// \param EnclosingPad  EH pad representing the handler enclosing this one
+  ///                      if there is one, ConstantTokenNone otherwise.
+  /// \returns A new CatchPad/CleanupPad in a populated EH pad block.
+  llvm::Instruction *createEHPad(EHRegion *Handler, llvm::Value *EnclosingPad);
+
   IRNode *fgNodeFindStartLabel(FlowGraphNode *Block) override;
 
   BranchList *fgGetLabelBranchList(IRNode *LabelNode) override {
     throw NotYetImplementedException("fgGetLabelBranchList");
   };
 
-  void insertHandlerAnnotation(EHRegion *HandlerRegion) override {
-    throw NotYetImplementedException("insertHandlerAnnotation");
-  };
-  void insertRegionAnnotation(IRNode *RegionStartNode,
-                              IRNode *RegionEndNode) override {
-    throw NotYetImplementedException("insertRegionAnnotation");
-  };
   void fgAddLabelToBranchList(IRNode *LabelNode, IRNode *BranchNode) override;
   void fgAddArc(IRNode *BranchNode, FlowGraphNode *Source,
                 FlowGraphNode *Sink) override {
@@ -584,44 +555,27 @@ public:
   };
   bool fgBlockHasFallThrough(FlowGraphNode *Block) override;
 
+  void fgRemoveUnusedBlocks(FlowGraphNode *FgHead) override;
   void fgDeleteBlock(FlowGraphNode *Block) override;
-  void fgDeleteEdge(FlowGraphEdgeList *Arc) override {
+  void fgDeleteEdge(FlowGraphEdgeIterator &Iterator) override {
     throw NotYetImplementedException("fgDeleteEdge");
-  };
+  }
   void fgDeleteNodesFromBlock(FlowGraphNode *Block) override;
   IRNode *fgNodeGetEndInsertIRNode(FlowGraphNode *FgNode) override;
 
-  bool commonTailCallChecks(CORINFO_METHOD_HANDLE DeclaredMethod,
-                            CORINFO_METHOD_HANDLE ExactMethod,
-                            bool IsUnmarkedTailCall, bool SuppressMsgs);
+  bool tailCallChecks(CORINFO_METHOD_HANDLE DeclaredMethod,
+                      CORINFO_METHOD_HANDLE ExactMethod,
+                      bool IsUnmarkedTailCall,
+                      bool HasIndirectResultOrArgument);
 
-  // Returns true iff client considers the JMP recursive and wants a
-  // loop back-edge rather than a forward edge to the exit label.
-  bool fgOptRecurse(mdToken Token) override;
-
-  // Returns true iff client considers the CALL/JMP recursive and wants a
-  // loop back-edge rather than a forward edge to the exit label.
-  bool fgOptRecurse(ReaderCallTargetData *Data) override;
-
-  // Returns true if node (the start of a new eh Region) cannot be the start of
-  // a block.
-  bool fgEHRegionStartRequiresBlockSplit(IRNode *Node) override {
-    throw NotYetImplementedException("fgEHRegionStartRequiresBlockSplit");
-  };
-
-  bool fgIsExceptRegionStartNode(IRNode *Node) override {
-    throw NotYetImplementedException("fgIsExceptRegionStartNode");
-  };
   FlowGraphNode *fgSplitBlock(FlowGraphNode *Block, IRNode *Node) override;
-  void fgSetBlockToRegion(FlowGraphNode *Block, EHRegion *Region,
-                          uint32_t LastOffset) override {
-    throw NotYetImplementedException("fgSetBlockToRegion");
-  };
   IRNode *fgMakeBranch(IRNode *LabelNode, IRNode *InsertNode,
                        uint32_t CurrentOffset, bool IsConditional,
                        bool IsNominal) override;
   IRNode *fgMakeEndFinally(IRNode *InsertNode, EHRegion *FinallyRegion,
                            uint32_t CurrentOffset) override;
+  IRNode *fgMakeEndFault(IRNode *InsertNode, EHRegion *FaultRegion,
+                         uint32_t CurrentOffset) override;
 
   // turns an unconditional branch to the entry label into a fall-through
   // or a branch to the exit label, depending on whether it was a recursive
@@ -632,39 +586,15 @@ public:
 
   IRNode *fgMakeSwitch(IRNode *DefaultLabel, IRNode *Insert) override;
 
+  IRNode *fgMakeReturn(IRNode *Insert) override;
   IRNode *fgMakeThrow(IRNode *Insert) override;
   IRNode *fgAddCaseToCaseList(IRNode *SwitchNode, IRNode *LabelNode,
                               unsigned Element) override;
 
-  void insertEHAnnotationNode(IRNode *InsertionPointNode,
-                              IRNode *InsertNode) override {
-    throw NotYetImplementedException("insertEHAnnotationNode");
-  };
   FlowGraphNode *makeFlowGraphNode(uint32_t TargetOffset,
-                                   EHRegion *Region) override;
-  void markAsEHLabel(IRNode *LabelNode) override {
-    throw NotYetImplementedException("markAsEHLabel");
-  };
-  IRNode *makeTryEndNode(void) override {
-    throw NotYetImplementedException("makeTryEndNode");
-  };
-  IRNode *makeRegionStartNode(ReaderBaseNS::RegionKind RegionType) override {
-    throw NotYetImplementedException("makeRegionStartNode");
-  };
-  IRNode *makeRegionEndNode(ReaderBaseNS::RegionKind RegionType) override {
-    throw NotYetImplementedException("makeRegionEndNode");
-  };
-
+                                   FlowGraphNode *PreviousNode) override;
   // Allow client to override reader's decision to optimize castclass/isinst
   bool disableCastClassOptimization();
-
-  // Hook to permit client to record call information returns true if the call
-  // is a recursive tail
-  // call and thus should be turned into a loop
-  bool fgCall(ReaderBaseNS::OPCODE Opcode, mdToken Token,
-              mdToken ConstraintToken, unsigned MsilOffset, IRNode *Block,
-              bool CanInline, bool IsTailCall, bool IsUnmarkedTailCall,
-              bool IsReadOnly) override;
 
   // Replace all uses of oldNode in the IR with newNode and delete oldNode.
   void replaceFlowGraphNodeUses(FlowGraphNode *OldNode,
@@ -678,26 +608,9 @@ public:
     throw NotYetImplementedException("entryLabel");
   };
 
-  // Function is passed a try region, and is expected to return the first label
-  // or instruction
-  // after the region.
-  IRNode *findTryRegionEndOfClauses(EHRegion *TryRegion) override {
-    throw NotYetImplementedException("findTryRegionEndOfClauses");
-  };
-
   bool isCall() override { throw NotYetImplementedException("isCall"); };
   bool isRegionStartBlock(FlowGraphNode *Fg) override {
     throw NotYetImplementedException("isRegionStartBlock");
-  };
-  bool isRegionEndBlock(FlowGraphNode *Fg) override {
-    throw NotYetImplementedException("isRegionEndBlock");
-  };
-
-  // Create a symbol node that will be used to represent the stack-incoming
-  // exception object
-  // upon entry to funclets.
-  IRNode *makeExceptionObject() override {
-    throw NotYetImplementedException("makeExceptionObject");
   };
 
   // //////////////////////////////////////////////////////////////////////////
@@ -706,7 +619,6 @@ public:
 
   // Asks GenIR to make operand value accessible by address, and return a node
   // that references the incoming operand by address.
-  IRNode *addressOfLeaf(IRNode *Leaf) override;
   IRNode *addressOfValue(IRNode *Leaf) override;
 
   IRNode *genNewMDArrayCall(ReaderCallTargetData *CallTargetData,
@@ -721,26 +633,111 @@ public:
                               IRNode *ThisArg) override;
 
   // Helper callback used by rdrCall to emit call code.
-  IRNode *genCall(ReaderCallTargetData *CallTargetInfo,
+  IRNode *genCall(ReaderCallTargetData *CallTargetInfo, bool MayThrow,
                   std::vector<IRNode *> Args, IRNode **CallNode) override;
 
   bool canMakeDirectCall(ReaderCallTargetData *CallTargetData) override;
 
   // Generate call to helper
-  IRNode *callHelper(CorInfoHelpFunc HelperID, IRNode *Dst,
+  IRNode *callHelper(CorInfoHelpFunc HelperID, bool MayThrow, IRNode *Dst,
                      IRNode *Arg1 = nullptr, IRNode *Arg2 = nullptr,
                      IRNode *Arg3 = nullptr, IRNode *Arg4 = nullptr,
                      ReaderAlignType Alignment = Reader_AlignUnknown,
                      bool IsVolatile = false, bool NoCtor = false,
                      bool CanMoveUp = false) override;
 
-  // Generate call to helper
-  IRNode *callHelperImpl(CorInfoHelpFunc HelperID, llvm::Type *ReturnType,
-                         IRNode *Arg1 = nullptr, IRNode *Arg2 = nullptr,
-                         IRNode *Arg3 = nullptr, IRNode *Arg4 = nullptr,
-                         ReaderAlignType Alignment = Reader_AlignUnknown,
-                         bool IsVolatile = false, bool NoCtor = false,
-                         bool CanMoveUp = false);
+  IRNode *callHelper(CorInfoHelpFunc HelperID, IRNode *HelperAddress,
+                     bool MayThrow, IRNode *Dst, IRNode *Arg1 = nullptr,
+                     IRNode *Arg2 = nullptr, IRNode *Arg3 = nullptr,
+                     IRNode *Arg4 = nullptr,
+                     ReaderAlignType Alignment = Reader_AlignUnknown,
+                     bool IsVolatile = false, bool NoCtor = false,
+                     bool CanMoveUp = false) override;
+
+  IRNode *callReadyToRunHelper(CorInfoHelpFunc HelperID, bool MayThrow,
+                               IRNode *Dst,
+                               CORINFO_RESOLVED_TOKEN *pResolvedToken,
+                               IRNode *Arg1 = nullptr, IRNode *Arg2 = nullptr,
+                               IRNode *Arg3 = nullptr, IRNode *Arg4 = nullptr,
+                               ReaderAlignType Alignment = Reader_AlignUnknown,
+                               bool IsVolatile = false, bool NoCtor = false,
+                               bool CanMoveUp = false) override;
+
+  /// \brief Generate call to a helper.
+  ///
+  /// \param HelperID        Helper ID.
+  /// \param MayThrow        True iff this helper may throw.
+  /// \param ReturnType      Return type.
+  /// \param Arg1            First helper argument.
+  /// \param Arg2            Second helper argument.
+  /// \param Arg3            Third helper argument.
+  /// \param Arg4            Fourth helper argument.
+  /// \param Alignment       Memory alignment for helpers that care about it.
+  /// \param IsVolatile      True iff the operation performed by the helper is
+  ///                        volatile.
+  /// \param NoCtor          True if the operation definitely will NOT invoke
+  ///                        the static constructor.
+  /// \param CanMoveUp       True iff the call may be moved up out of loops.
+  ///
+  /// \returns An \p CallSite corresponding to the helper call.
+  llvm::CallSite callHelperImpl(CorInfoHelpFunc HelperID, bool MayThrow,
+                                llvm::Type *ReturnType, IRNode *Arg1 = nullptr,
+                                IRNode *Arg2 = nullptr, IRNode *Arg3 = nullptr,
+                                IRNode *Arg4 = nullptr,
+                                ReaderAlignType Alignment = Reader_AlignUnknown,
+                                bool IsVolatile = false, bool NoCtor = false,
+                                bool CanMoveUp = false);
+
+  /// \brief Generate call to a helper.
+  ///
+  /// \param HelperID        Helper ID.
+  /// \param HelperAddress   Address of the helper.
+  /// \param MayThrow        True iff this helper may throw.
+  /// \param ReturnType      Return type.
+  /// \param Arg1            First helper argument.
+  /// \param Arg2            Second helper argument.
+  /// \param Arg3            Third helper argument.
+  /// \param Arg4            Fourth helper argument.
+  /// \param Alignment       Memory alignment for helpers that care about it.
+  /// \param IsVolatile      True iff the operation performed by the helper is
+  ///                        volatile.
+  /// \param NoCtor          True if the operation definitely will NOT invoke
+  ///                        the static constructor.
+  /// \param CanMoveUp       True iff the call may be moved up out of loops.
+  ///
+  /// \returns An \p CallSite corresponding to the helper call.
+  llvm::CallSite callHelperImpl(CorInfoHelpFunc HelperID, IRNode *HelperAddress,
+                                bool MayThrow, llvm::Type *ReturnType,
+                                IRNode *Arg1 = nullptr, IRNode *Arg2 = nullptr,
+                                IRNode *Arg3 = nullptr, IRNode *Arg4 = nullptr,
+                                ReaderAlignType Alignment = Reader_AlignUnknown,
+                                bool IsVolatile = false, bool NoCtor = false,
+                                bool CanMoveUp = false);
+
+  /// \brief Generate call to a ReadyToRun helper.
+  ///
+  /// \param HelperID        Helper ID.
+  /// \param MayThrow        True iff this helper may throw.
+  /// \param ReturnType      Return type.
+  /// \param ResolvedToken   Token corresponding to the helper.
+  /// \param Arg1            First helper argument.
+  /// \param Arg2            Second helper argument.
+  /// \param Arg3            Third helper argument.
+  /// \param Arg4            Fourth helper argument.
+  /// \param Alignment       Memory alignment for helpers that care about it.
+  /// \param IsVolatile      True iff the operation performed by the helper is
+  ///                        volatile.
+  /// \param NoCtor          True if the operation definitely will NOT invoke
+  ///                        the static constructor.
+  /// \param CanMoveUp       True iff the call may be moved up out of loops.
+  ///
+  /// \returns An \p CallSite corresponding to the helper call.
+  llvm::CallSite callReadyToRunHelperImpl(
+      CorInfoHelpFunc HelperID, bool MayThrow, llvm::Type *ReturnType,
+      CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *Arg1 = nullptr,
+      IRNode *Arg2 = nullptr, IRNode *Arg3 = nullptr, IRNode *Arg4 = nullptr,
+      ReaderAlignType Alignment = Reader_AlignUnknown, bool IsVolatile = false,
+      bool NoCtor = false, bool CanMoveUp = false);
 
   /// Generate special generics helper that might need to insert flow. The
   /// helper is called if NullCheckArg is null at compile-time or if it
@@ -753,14 +750,25 @@ public:
   /// \returns Generated call instruction if NullCheckArg is null; otherwise,
   /// PHI of NullCheckArg and the generated call instruction.
   IRNode *callRuntimeHandleHelper(CorInfoHelpFunc Helper, IRNode *Arg1,
-                                  IRNode *Arg2, IRNode *NullCheckArg);
+                                  IRNode *Arg2, IRNode *NullCheckArg) override;
+
+  /// Generate a helper call to enter or exit a monitor used by synchronized
+  /// methods.
+  ///
+  /// \param IsEnter true if the monitor should be entered; false if the monitor
+  /// should be exited.
+  void callMonitorHelper(bool IsEnter);
 
   IRNode *convertToBoxHelperArgumentType(IRNode *Opr,
-                                         CorInfoType CorType) override;
+                                         uint32_t DestSize) override;
 
   IRNode *makeBoxDstOperand(CORINFO_CLASS_HANDLE Class) override;
 
   IRNode *genNullCheck(IRNode *Node) override;
+
+  llvm::AllocaInst *createAlloca(llvm::Type *T,
+                                 llvm::Value *ArraySize = nullptr,
+                                 const llvm::Twine &Name = "");
 
   void
   createSym(uint32_t Num, bool IsAuto, CorInfoType CorType,
@@ -774,10 +782,58 @@ public:
 
   IRNode *getHelperCallAddress(CorInfoHelpFunc HelperId) override;
 
+  /// \brief Get address of a ReadyToRun helper.
+  ///
+  /// \param HelperID        Helper ID.
+  /// \param ResolvedToken   Token corresponding to the helper.
+  ///
+  /// \returns An \p IRNode corresponding to the helper address.
+  IRNode *getReadyToRunHelperCallAddress(CorInfoHelpFunc HelperID,
+                                         CORINFO_RESOLVED_TOKEN *ResolvedToken);
+
   IRNode *handleToIRNode(mdToken Token, void *EmbedHandle, void *RealHandle,
                          bool IsIndirect, bool IsReadOnly, bool IsRelocatable,
                          bool IsCallTarget,
                          bool IsFrozenObject = false) override;
+
+  /// \brief Convert handle into an \p IRNode.
+  ///
+  /// \param HandleName      Name to use for the GlobalObject corresponding
+  ///                        to a relocatable handle.
+  /// \param EmbedHandle     Handle to convert.
+  /// \param RealHandle      Optional compile-time handle.
+  /// \param IsIndirect      True iff the handle represents an indirection.
+  /// \param IsReadonly      True iff the handle represent a read-only value.
+  /// \param IsRelocatable   True iff the handle is relocatable.
+  /// \param IsCallTarget    True iff the handle represents a call target.
+  /// \param IsFrozenObject  True iff the handle represents a frozen object.
+  ///
+  /// \returns An \p IRNode corresponding to the handle.
+  IRNode *handleToIRNode(const std::string &HandleName, void *EmbedHandle,
+                         void *RealHandle, bool IsIndirect, bool IsReadOnly,
+                         bool IsRelocatable, bool IsCallTarget,
+                         bool IsFrozenObject = false);
+
+  /// Indicate whether the reader has encountered a call to unmanaged code in
+  /// this method.
+  ///
+  /// \returns True iff an unmanaged call has been discovered.
+  bool containsUnmanagedCall() { return UnmanagedCallFrame != nullptr; }
+
+  /// Generate a name for the given token, handle, context and scope. The names
+  /// generated by this method are used for GlobalObjects corresponding to the
+  /// handles.
+  ///
+  /// \param Token Token to use for name generation.
+  /// \param Handle Handle to use for name generation.
+  /// \param Context Context to use for name generation..
+  /// \param Scope Scope to use for name generation.
+  /// \returns Name for the given token, handle, context, and scope.
+  std::string getNameForToken(mdToken Token, CORINFO_GENERIC_HANDLE Handle,
+                              CORINFO_CONTEXT_HANDLE Context,
+                              CORINFO_MODULE_HANDLE Scope);
+
+  IRNode *makeRefAnyDstOperand(CORINFO_CLASS_HANDLE Class) override;
 
   // Create an operand that will be used to hold a pointer.
   IRNode *makePtrDstGCOperand(bool IsInteriorGC) override {
@@ -790,7 +846,11 @@ public:
     throw NotYetImplementedException("makeStackTypeNode");
   };
 
-  IRNode *makeDirectCallTargetNode(void *CodeAddr) override;
+  IRNode *makeDirectCallTargetNode(CORINFO_METHOD_HANDLE MethodHandle,
+                                   mdToken MethodToken,
+                                   void *CodeAddr) override;
+
+  CORINFO_CLASS_HANDLE inferThisClass(IRNode *ThisArgument) override;
 
   // Called once region tree has been built.
   void setEHInfo(EHRegion *EhRegionTree, EHRegionList *EhRegionList) override;
@@ -816,12 +876,8 @@ public:
 #endif
 
   // Used to expand multidimensional array access intrinsics
-  bool arrayGet(CORINFO_SIG_INFO *Sig, IRNode **RetVal) override {
-    throw NotYetImplementedException("arrayGet");
-  };
-  bool arraySet(CORINFO_SIG_INFO *Sig) override {
-    throw NotYetImplementedException("arraySet");
-  };
+  bool arrayGet(CORINFO_SIG_INFO *Sig, IRNode **RetVal) override;
+  bool arraySet(CORINFO_SIG_INFO *Sig) override;
 
 #if !defined(NDEBUG)
   void dbDumpFunction(void) override {
@@ -840,11 +896,44 @@ public:
 #endif
 
 private:
-  llvm::Type *getType(CorInfoType Type, CORINFO_CLASS_HANDLE ClassHandle,
-                      bool GetRefClassFields = true);
+  /// \brief Get llvm type corresponding to Type and ClassHandle.
+  ///
+  /// \param Type  Type to get llvm type for.
+  /// \param ClassHandle   Class handle to get llvm type for.
+  /// \param GetAggregateFields  true iff this method should get type details
+  ///        for fields in case this is an aggregate or a pointer to an
+  ///        aggregate.
+  /// \param DeferredDetailClasses  List to append aggregates whose details
+  ///        weren't fully resolved.
+  /// \returns       llvm type corresponding to Type and ClassHandle.
+  llvm::Type *
+  getType(CorInfoType Type, CORINFO_CLASS_HANDLE ClassHandle,
+          bool GetAggregateFields = true,
+          std::list<CORINFO_CLASS_HANDLE> *DeferredDetailClasses = nullptr);
 
-  llvm::Type *getClassType(CORINFO_CLASS_HANDLE ClassHandle, bool IsRefClass,
-                           bool GetRefClassFields);
+  /// \brief Get llvm type corresponding to ClassHandle.
+  ///
+  /// \param ClassHandle   Class handle to get llvm type for.
+  /// \param GetAggregateFields  true iff this method should get type details
+  ///        for fields of this aggregate.
+  /// \param DeferredDetailClasses  List to append aggregates whose details
+  ///        weren't fully resolved.
+  /// \returns       llvm type corresponding to ClassHandle.
+  llvm::Type *
+  getClassType(CORINFO_CLASS_HANDLE ClassHandle, bool GetAggregateFields,
+               std::list<CORINFO_CLASS_HANDLE> *DeferredDetailAggregates);
+
+  /// \brief Get llvm type corresponding to ClassHandle.
+  ///
+  /// \param ClassHandle   Class handle to get llvm type for.
+  /// \param GetAggregateFields  true iff this method should get type details
+  ///        for fields of this aggregate.
+  /// \param DeferredDetailClasses  List to append aggregates whose details
+  ///        weren't fully resolved.
+  /// \returns       llvm type corresponding to ClassHandle.
+  llvm::Type *
+  getClassTypeWorker(CORINFO_CLASS_HANDLE ClassHandle, bool GetAggregateFields,
+                     std::list<CORINFO_CLASS_HANDLE> *DeferredDetailClasses);
 
   /// \brief Construct the LLVM type of the boxed representation of the given
   ///        value type.
@@ -861,7 +950,18 @@ private:
   /// integral values are zero extended
   IRNode *convert(llvm::Type *Type, llvm::Value *Node, bool IsSigned);
 
-  llvm::Type *binaryOpType(llvm::Type *Type1, llvm::Type *Type2);
+  /// \brief Determine the result type of a binary op.
+  ///
+  /// Rougly follows table III.2 of Ecma-335, with some extra cases added
+  /// because LLILC and IL stubs use this in non-standard ways. Note the result
+  /// is opcode-dependent and that Type1 and Type2 are not symmetric.
+  ///
+  /// \param Opcode  The binary opcode.
+  /// \param Type1   Type of the first operand popped from the operand stack.
+  /// \param Type2   Type of the second operand popped from the operand stack.
+  /// \returns       Type of the result.
+  llvm::Type *binaryOpType(ReaderBaseNS::BinaryOpcode Opcode, llvm::Type *Type1,
+                           llvm::Type *Type2);
 
   IRNode *genPointerAdd(IRNode *Arg1, IRNode *Arg2);
   IRNode *genPointerSub(IRNode *Arg1, IRNode *Arg2);
@@ -873,8 +973,19 @@ private:
                              CORINFO_RESOLVED_TOKEN *ResolvedToken,
                              CORINFO_FIELD_INFO *FieldInfo) override;
 
-  IRNode *getPrimitiveAddress(IRNode *Addr, CorInfoType CorInfoType,
-                              ReaderAlignType Alignment, uint32_t *Align);
+  /// Get a node with the same value as Addr but typed as a pointer to the type
+  /// corresponding to CorInfoType and ClassHandle.
+  ///
+  /// \param Addr Address to change the type on.
+  /// \param  CorInfoType Type that Addr should point to.
+  /// \param ClassHandle Class handle corresponding to CorInfoType.
+  /// \param ReaderAlignment Reader alignment of the Addr access.
+  /// \param Alignment [out] Converted alignment corresponding to
+  /// ReaderAlignment.
+  /// \returns Address pointing to a value of the specified type.
+  IRNode *getTypedAddress(IRNode *Addr, CorInfoType CorInfoType,
+                          CORINFO_CLASS_HANDLE ClassHandle,
+                          ReaderAlignType ReaderAlignment, uint32_t *Alignment);
   /// Generate instructions for loading value of the specified type at the
   /// specified address.
   ///
@@ -899,6 +1010,18 @@ private:
                                bool IsVolatile) {
     return loadAtAddress(Address, Ty, CorType, ResolvedToken, AlignmentPrefix,
                          IsVolatile, false);
+  }
+
+  IRNode *loadAtAddress(IRNode *Address, llvm::Type *Ty, CorInfoType CorType,
+                        ReaderAlignType AlignmentPrefix, bool IsVolatile,
+                        bool AddressMayBeNull = true);
+
+  IRNode *loadAtAddressNonNull(IRNode *Address, llvm::Type *Ty,
+                               CorInfoType CorType,
+                               ReaderAlignType AlignmentPrefix,
+                               bool IsVolatile) {
+    return loadAtAddress(Address, Ty, CorType, AlignmentPrefix, IsVolatile,
+                         false);
   }
 
   /// Generate instructions for storing value of the specified type at the
@@ -927,8 +1050,34 @@ private:
                           AlignmentPrefix, IsVolatile, IsField, false);
   }
 
+  /// Generate instructions for storing value of the specified type at the
+  /// specified address. The caller must guarantee that address is not null and
+  /// no write barrier is needed.
+  ///
+  /// \param Address Address to store to.
+  /// \param ValueToStore Value to store.
+  /// \param Ty llvm type of the value to store.
+  /// \param IsVolatile true iff the store is volatile.
+  void storeAtAddressNoBarrierNonNull(IRNode *Address, IRNode *ValueToStore,
+                                      llvm::Type *Ty, bool IsVolatile);
+
   void classifyCmpType(llvm::Type *Ty, uint32_t &Size, bool &IsPointer,
                        bool &IsFloat);
+
+  /// \brief Create a basic block for use when expanding a single MSIL
+  /// instruction.
+  ///
+  /// Use this method to create a block when expanding a single MSIL
+  /// instruction into an instruction sequence with control flow. Give the
+  /// block the given MSIL offset at both begin and end since it represents
+  /// code at a single point in the IL stream. Mark the block as not
+  /// contributing an operand stack to any subsequent join.
+  ///
+  /// \param PointOffset       MSIL offset the block starts and ends at.
+  /// \param BlockName         Optional name for the new block.
+  /// \returns                 Newly allocated block.
+  llvm::BasicBlock *createPointBlock(uint32_t PointOffset,
+                                     const llvm::Twine &BlockName = "");
 
   /// \brief Create a basic block for use when expanding a single MSIL
   /// instruction.
@@ -941,7 +1090,9 @@ private:
   ///
   /// \param BlockName         Optional name for the new block.
   /// \returns                 Newly allocated block.
-  llvm::BasicBlock *createPointBlock(const llvm::Twine &BlockName = "");
+  llvm::BasicBlock *createPointBlock(const llvm::Twine &BlockName = "") {
+    return createPointBlock(CurrInstrOffset, BlockName);
+  }
 
   /// \brief Insert a conditional branch to a point block.
   ///
@@ -974,6 +1125,18 @@ private:
   /// \returns          The newly-created successor block
   llvm::BasicBlock *splitCurrentBlock(llvm::TerminatorInst **Goto = nullptr);
 
+  /// \brief Move point blocks preceding \p OldBlock to just before \p NewBlock
+  ///
+  /// Point blocks created during the first pass flow-graph construction are
+  /// inserted before temp blocks created for their point.  Then they are moved
+  /// to the appropriate spot when branches to temp blocks are being rewritten.
+  /// This is the routine invoked during branch rewriting to move them.
+  ///
+  /// \param OldBlock Temporary block whose associated point blocks are to be
+  ///                 fixed up
+  /// \param NewBlock "Real" block that begins at the point in question
+  void movePointBlocks(llvm::BasicBlock *OldBlock, llvm::BasicBlock *NewBlock);
+
   /// Insert one instruction in place of another.
   ///
   /// \param OldInstruction The instruction to be removed.  Must have no uses.
@@ -981,6 +1144,12 @@ private:
   ///                       was.
   void replaceInstruction(llvm::Instruction *OldInstruction,
                           llvm::Instruction *NewInstruction);
+
+  /// Annotate the given call/invoke as a gc-leaf-function.  This informs
+  /// lowering that it does not need to be handled as a gc safe-point.
+  ///
+  /// \param Call - The call/invoke to annotate.
+  void markGCLeaf(llvm::CallSite Call);
 
   /// \brief Insert a PHI to merge two values
   ///
@@ -1009,17 +1178,19 @@ private:
   ///
   /// \param Condition Condition that will trigger the call.
   /// \param HelperId Id of the call helper.
+  /// \param MayThrow true if the helper call may raise an exception.
   /// \param ReturnType Return type of the call helper.
   /// \param Arg1 First helper argument.
   /// \param Arg2 Second helper argument.
   /// \param CallReturns true iff the helper call returns.
   /// \param CallBlockName Name of the basic block that will contain the call.
-  /// \returns Generated call instruction.
-  llvm::CallInst *genConditionalHelperCall(llvm::Value *Condition,
-                                           CorInfoHelpFunc HelperId,
-                                           llvm::Type *ReturnType, IRNode *Arg1,
-                                           IRNode *Arg2, bool CallReturns,
-                                           const llvm::Twine &CallBlockName);
+  /// \returns Generated call/invoke instruction.
+  llvm::CallSite genConditionalHelperCall(llvm::Value *Condition,
+                                          CorInfoHelpFunc HelperId,
+                                          bool MayThrow, llvm::Type *ReturnType,
+                                          IRNode *Arg1, IRNode *Arg2,
+                                          bool CallReturns,
+                                          const llvm::Twine &CallBlockName);
 
   /// Generate a call to the throw helper if the condition is met.
   ///
@@ -1031,10 +1202,9 @@ private:
 
   /// Generate array bounds check.
   ///
-  /// \param Array Array to be accessed.
+  /// \param ArrayLength Length of the array to be accessed.
   /// \param Index Index to be accessed.
-  /// \returns The input array.
-  IRNode *genBoundsCheck(IRNode *Array, IRNode *Index);
+  void genBoundsCheck(llvm::Value *ArrayLength, llvm::Value *Index);
 
   /// \brief Generate conditional throw for conv.ovf.
   ///
@@ -1059,6 +1229,15 @@ private:
 
   uint32_t size(CorInfoType CorType);
   uint32_t stackSize(CorInfoType CorType);
+
+  /// \brief Determine whether a \p CorInfoType represents a signed integral
+  ///        type.
+  ///
+  /// \param CorType  The \p CorInfoType in question.
+  ///
+  /// \returns True if \p CorType represents a signed integral type.
+  static bool isSignedIntegralType(CorInfoType CorType);
+
   static bool isSigned(CorInfoType CorType);
   llvm::Type *getStackType(CorInfoType CorType);
 
@@ -1080,13 +1259,19 @@ private:
 
   /// Get the type of the result of the merge of two values from operand stacks
   /// of a block's predecessors. The allowed combinations are nativeint and
-  // int32 (resulting in nativeint), float and double (resulting in double),
-  /// and GC pointers (resulting in the closest common supertype).
+  /// int32 (resulting in whichever was first), float and double
+  /// (resulting in double), and GC pointers (resulting in the closest common
+  /// supertype).
   ///
   /// \param Ty1 Type of the first value.
   /// \param Ty1 Type of the second value.
+  /// \param IsStruct1 true iff value corresponding to Ty1 logically represents
+  /// a struct rather than a pointer to struct.
+  /// \param IsStruct2 true iff value corresponding to Ty2 logically represents
+  /// a struct rather than a pointer to struct.
   /// \returns The result type.
-  llvm::Type *getStackMergeType(llvm::Type *Ty1, llvm::Type *Ty2);
+  llvm::Type *getStackMergeType(llvm::Type *Ty1, llvm::Type *Ty2,
+                                bool IsStruct1, bool isStruct2);
 
   bool objIsThis(IRNode *Obj);
 
@@ -1105,10 +1290,6 @@ private:
 
   llvm::PointerType *getUnmanagedPointerType(llvm::Type *ElementType);
 
-  bool isManagedType(llvm::Type *Type);
-  bool isManagedPointerType(llvm::Type *Type);
-  bool isManagedAggregateType(llvm::Type *Type);
-
   llvm::StoreInst *makeStore(llvm::Value *ValueToStore, llvm::Value *Address,
                              bool IsVolatile, bool AddressMayBeNull = true);
   llvm::StoreInst *makeStoreNonNull(llvm::Value *ValueToStore,
@@ -1122,10 +1303,24 @@ private:
     return makeLoad(Address, IsVolatile, false);
   }
 
+  /// \brief Create a call or invoke instruction
+  ///
+  /// The call is inserted at the LLVMBuilder's current insertion point.
+  ///
+  /// \param Callee    Target of the call
+  /// \param MayThrow  True if the callee may raise an exception
+  /// \param Args      Arguments to pass to the callee
+  /// \param Bundles   Operand bundles to attach to the call
+  /// \returns         A \p CallSite wrapping the CallInst or InvokeInst
+  llvm::CallSite
+  makeCall(llvm::Value *Callee, bool MayThrow,
+           llvm::ArrayRef<llvm::Value *> Args,
+           llvm::ArrayRef<llvm::OperandBundleDef> Bundles = llvm::None);
+
   /// Store a value to an argument passed indirectly.
   ///
-  /// The storage backing such arguments may be loacted on the heap; any stores
-  /// to these loactions may need write barriers.
+  /// The storage backing such arguments may be located on the heap; any stores
+  /// to these locations may need write barriers.
   ///
   /// \param ValueArgType  EE type info for the value to store.
   /// \param ValueToStore  The value to store.
@@ -1150,19 +1345,62 @@ private:
   /// \returns Alignment in bytes.
   uint32_t convertReaderAlignment(ReaderAlignType ReaderAlignment);
 
-  /// Get array element type.
+  /// \brief Get array element type expected for an MSIL instruction.
   ///
-  /// \param Array Array node.
+  /// Note: we avoid the name getArrayElementType to avoid confusion
+  /// with llvm::Type::getArrayElementType.
+  ///
+  /// \param Array         When the CorInfoType is CORINFO_TYPE_CLASS this
+  ///                      is a call for ldelem.ref or stelem.ref. In that
+  ///                      case the element type is the same as element type
+  ///                      of the input array, so we need to pass it in.
   /// \param ResolvedToken Resolved token from ldelem or stelem instruction.
-  /// \param CorInfoType [IN/OUT] Type of the element (will be resolved for
+  /// \param CorType - [IN/OUT] Type of the element (will be resolved for
   /// CORINFO_TYPE_UNDEF).
   /// \param Alignment - [IN/OUT] Alignment that will be updated for value
   /// classes.
-  /// \returns Array element type.
-  llvm::Type *getArrayElementType(IRNode *Array,
-                                  CORINFO_RESOLVED_TOKEN *ResolvedToken,
-                                  CorInfoType *CorType,
-                                  ReaderAlignType *Alignment);
+  /// \returns LLVM Array element type.
+  llvm::Type *getMSILArrayElementType(IRNode *Array,
+                                      CORINFO_RESOLVED_TOKEN *ResolvedToken,
+                                      CorInfoType *CorType,
+                                      ReaderAlignType *Alignment);
+
+  /// Check whether access to this multidimensional array can be expanded as an
+  /// intrinsic.
+  ///
+  /// \param Sig Intrinsic signature.
+  /// \param IsStore true iff this array access is a store.
+  /// \param IsLoadAddr true iff this array access is a load of an element
+  /// address.
+  /// \param Rank [OUT] Array rank.
+  /// \param ElemCorType [OUT] CorType of the array element.
+  /// \param ElemType [OUT] Type of the array element.
+  /// \returns true iff access to this multidimensional array can be expanded as
+  /// an intrinsic.
+  bool canExpandMDArrayRef(CORINFO_SIG_INFO *Sig, bool IsStore, bool IsLoadAddr,
+                           uint32_t *Rank, CorInfoType *ElemCorType,
+                           llvm::Type **ElemType);
+
+  /// Get address of an element of a multidimensional array.
+  ///
+  /// This method reads array address and indices for each dimensions from the
+  /// operand stack.
+  ///
+  /// \param Rank Array rank.
+  /// \param ElemType Type of the array element.
+  /// \returns Node representing the address of the array element.
+  IRNode *mdArrayRefAddr(uint32_t Rank, llvm::Type *ElemType);
+
+  /// Get the length of the specified dimension of a multidimensional array
+  /// or a single-dimensional array with a non-zero lower bound.
+  ///
+  /// This method assumes that the array pointer is not null (i.e., the callers
+  //  are responsible for inserting a null check).
+  ///
+  /// \param Array Array object to get the dimension length of.
+  /// \param Dimension Array dimension.
+  /// \returns Node representing the length of the specified dimension.
+  IRNode *mdArrayGetDimensionLength(llvm::Value *Array, llvm::Value *Dimension);
 
   /// Create a PHI node in a block that may or may not have a terminator.
   ///
@@ -1176,13 +1414,14 @@ private:
                                unsigned int NumReservedValues,
                                const llvm::Twine &NameStr);
 
-  /// Add a new operand to the PHI instruction. The type of the new operand may
-  /// or may not equal to the type of the PHI instruction. Adjust the types as
-  /// necessary.
+  /// Update all undef placeholders corresponding to the new operand in the
+  /// PHI instruction. The type of the new operand may or may not equal the type
+  /// of the PHI instruction. Adjust the types as necessary.
   ///
   /// \param PHI PHI instruction.
   /// \param NewOperand Operand to add to the PHI instruction.
-  void AddPHIOperand(llvm::PHINode *PHI, llvm::Value *NewOperand,
+  /// \param NewBlock Basic block corresponding to NewOperand.
+  void addPHIOperand(llvm::PHINode *PHI, llvm::Value *NewOperand,
                      llvm::BasicBlock *NewBlock);
 
   /// Change the type of a PHI instruction operand as a result of a stack merge.
@@ -1191,7 +1430,7 @@ private:
   /// \param OperandBlock Basic block corresponding to the operand.
   /// \param NewTy New type of the operand.
   /// \returns Operand with the changed type.
-  llvm::Value *ChangePHIOperandType(llvm::Value *Operand,
+  llvm::Value *changePHIOperandType(llvm::Value *Operand,
                                     llvm::BasicBlock *OperandBlock,
                                     llvm::Type *NewTy);
 
@@ -1217,18 +1456,300 @@ private:
   /// \brief Insert IR to setup the security object
   void insertIRForSecurityObject();
 
+  /// \brief Insert IR to setup the unmanaged call frame (PInvoke frame) and
+  ///        the thread pointer.
+  void insertIRForUnmanagedCallFrame();
+
   /// \brief Create the @gc.safepoint_poll() method
   /// Creates the @gc.safepoint_poll() method and insertes it into the
   /// current module. This helper is required by the LLVM GC-Statepoint
   /// insertion phase.
   void createSafepointPoll();
 
+  /// \brief Override of doTailCallOpt method
+  /// Provides client specific Options look up.
+  bool doTailCallOpt() override;
+
+  /// \brief Override of doSimdIntrinsicOpt method
+  /// Provides client specific Options look up.
+  bool doSimdIntrinsicOpt() override;
+
+  /// If isZeroInitLocals() returns true, zero intitialize all locals;
+  /// otherwise, zero initialize all gc pointers and structs with gc pointers.
+  void zeroInitLocals();
+
+  /// Zero initialize a stack allocation
+  void zeroInit(llvm::Value *Var);
+
+  /// Zero initialize the block.
+  ///
+  /// \param Address Address of the block.
+  /// \param Size Size of the block.
+  void zeroInitBlock(llvm::Value *Address, uint64_t Size);
+
+  /// Zero initialize the block.
+  ///
+  /// \param Address Address of the block.
+  /// \param Size Size of the block.
+  void zeroInitBlock(llvm::Value *Address, llvm::Value *Size);
+
+  /// Copy an instance of a struct from SourceAddress to DestinationAddress.
+  /// Copying is done without write barriers.
+  ///
+  /// \param StructTy Type of the struct.
+  /// \param DestinationAddress Address to copy to.
+  /// \param SourceAddress Address to copy from.
+  /// \param IsVolatile true iff copy is volatile.
+  /// \param Alignment Alignment of the copy.
+  void copyStructNoBarrier(llvm::Type *StructTy,
+                           llvm::Value *DestinationAddress,
+                           llvm::Value *SourceAddress, bool IsVolatile,
+                           ReaderAlignType Alignment = Reader_AlignNatural);
+
+  void copyStruct(CORINFO_CLASS_HANDLE Class, IRNode *Dst, IRNode *Src,
+                  ReaderAlignType Alignment, bool IsVolatile,
+                  bool IsUnchecked) override;
+
+  /// Check if this value represents a struct.
+  ///
+  /// \param TheValue Value to examine.
+  /// \returns true iff TheValue represents a struct.
+  bool doesValueRepresentStruct(llvm::Value *TheValue);
+
+  /// Records that TheValue represents a struct.
+  ///
+  /// \param TheValue Value to record.
+  void setValueRepresentsStruct(llvm::Value *TheValue);
+
+  /// Check if this LLVM type appears to be a CLR array type.
+  ///
+  /// \param Type       Type to examine.
+  /// \param ElementTy  If non-null, the element type that must match.
+  ///                   otherwise any element type will do.
+  /// \returns      True if this type looks like a CLR array type.
+  bool isArrayType(llvm::Type *Type, llvm::Type *ElementTy);
+
+  /// If the Array is not typed as an MSIL array with specified element type
+  /// cast it to that type.
+  ///
+  /// \param Array     The array for which we want to ensure its typing.
+  /// \param ElementTy The LLVM element type desired. If null, means we
+  ///                  do not care about element type. In that case if
+  ///                  we need to make an array type we will use
+  ///                  Sytem.Object as the element type.
+  /// \returns         The possibly-casted input array.
+  IRNode *ensureIsArray(IRNode *Array, llvm::Type *ElementTy);
+
+  /// Get the LLVM type for the built-in string type.
+  ///
+  /// \returns    LLVM type that models the built-in string type.
+  llvm::Type *getBuiltInStringType();
+
+  /// Get the LLVM type for the built-in object type.
+  ///
+  /// \returns    LLVM type that models the built-in object type.
+  llvm::Type *getBuiltInObjectType();
+
+  /// Get the LLVM type for an array of given element type.
+  ///
+  /// Used when we know that some type must be an array but our local
+  /// type information thinks otherwise.
+  ///
+  /// \param ElementTy                 The desired element type for the array,
+  /// \returns                         LLVM type that models the desired array
+  llvm::PointerType *getArrayOfElementType(llvm::Type *ElementTy);
+
+  /// \brief Creates the type of the array with specified element type.
+  ///
+  /// \param ElementTy The LLVM element type that is desired for the array type.
+  /// \returns The LLVM representation of the MSIL array type.
+  llvm::PointerType *createArrayOfElementType(llvm::Type *ElementTy);
+
+  /// Create the length, padding, and elements fields for an array type.
+  ///
+  /// \param Fields                    Field collection for the array. On input,
+  ///                                  should contain only the vtable pointer.
+  /// \param IsVector                  true iff this is a zero-lower-bound
+  ///                                  single-dimensional array.
+  /// \param ArrayRank                 Rank of the array.
+  /// \param ElementTy                 The LLVM element type desired.
+  /// \returns                         Byte size of the fields added. Fields
+  ///                                  updated with length, padding (if needed),
+  ///                                  and the array itself.
+  uint32_t addArrayFields(std::vector<llvm::Type *> &Fields, bool IsVector,
+                          uint32_t ArrayRank, llvm::Type *ElementTy);
+
+  /// Add fields of a type to the field vector, expanding structures
+  /// (recursively) to the types they contain.
+  ///
+  /// \param Fields    vector of offset, type info for overlapping fields.
+  /// \param Offset    offset of the new type to add.
+  /// \param Ty        the new type to add.
+  void
+  addFieldsRecursively(std::vector<std::pair<uint32_t, llvm::Type *>> &Fields,
+                       uint32_t Offset, llvm::Type *Ty);
+
+  /// Given a set of overlapping primitive typed fields, determine the set of
+  /// representative fields to used to describe these in an LLVM type and add
+  /// them to the field collection for that type. Ensure that any GC
+  /// references are properly described. Non-GC fields will be represented by
+  /// suitably sized byte arrays.
+  ///
+  /// \param OverlapFields [in, out]  On input, vector of offset, type info for
+  ///                                 overlapping fields. Empty on on exit.
+  /// \param Fields [in, out]         On input, vector of field types found so
+  ///                                 far for the ultimate type being
+  ///                                 constructed. On exit, extended with
+  ///                                 representative fields for the overlap set.
+  void createOverlapFields(
+      std::vector<std::pair<uint32_t, llvm::Type *>> &OverlapFields,
+      std::vector<llvm::Type *> &Fields);
+
+  /// Get class name for the given handle. Unlike getClassName, this method
+  /// returns namespace for all classes (including nested classes) and outputs
+  /// generic parameter names uniformly (without assembly, version, etc.).
+  ///
+  /// The caller of this method is expected to free the result using delete[].
+  ///
+  /// \param ClassHandle               The handle to get a name for.
+  /// \returns                         Class name corresponding to the handle.
+  char *getClassNameWithNamespace(CORINFO_CLASS_HANDLE ClassHandle);
+
+  /// Get a global variable for the given handles.
+  ///
+  /// \param LookupHandle              Handle to use for caching purposes.
+  /// \param ValueHandle               Handle to use as a relocation for the
+  ///                                  global variable.
+  /// \param Ty                        Type of the global variable.
+  /// \param Name                      Name of the global variable.
+  /// \param IsConstant                True if value of global never changes
+  /// \returns                         Global variable for the given handles.
+  llvm::GlobalVariable *getGlobalVariable(uint64_t LookupHandle,
+                                          uint64_t ValueHandle, llvm::Type *Ty,
+                                          llvm::StringRef Name,
+                                          bool IsConstant);
+
+  /// Get a function for the given handles.
+  ///
+  /// \param LookupHandle              Handle to use for caching purposes.
+  /// \param ValueHandle               Handle to use as a relocation for the
+  ///                                  global variable.
+  /// \param Ty                        Type of the function.
+  /// \param Name                      Name of the function.
+  /// \returns                         Function for the given handles.
+  llvm::Function *getFunction(uint64_t LookupHandle, uint64_t ValueHandle,
+                              llvm::FunctionType *Ty, llvm::StringRef Name);
+
+  /// Get a name as std::string.
+  ///
+  /// \param Class                     The handle to get a name for.
+  /// \param IncludeNamespace          Include the namespace/enclosing classes
+  ///                                  if true.
+  /// \param FullInst                  Include namespace and assembly for any
+  ///                                  type parameters if true.
+  /// \param IncludeAssembly           Suffix with a comma and the full assembly
+  ///                                  qualification if true.
+  /// \returns                         Class name corresponding to the handle.
+  std::string appendClassNameAsString(CORINFO_CLASS_HANDLE Class,
+                                      bool IncludeNamespace, bool FullInst,
+                                      bool IncludeAssembly) override;
+
+  IRNode *vectorAdd(IRNode *Vector1, IRNode *Vector2) override;
+  IRNode *vectorSub(IRNode *Vector1, IRNode *Vector2) override;
+  IRNode *vectorMul(IRNode *Vector1, IRNode *Vector2) override;
+  IRNode *vectorDiv(IRNode *Vector1, IRNode *Vector2, bool IsSigned) override;
+  IRNode *vectorEqual(IRNode *Vector1, IRNode *Vector2) override;
+  IRNode *vectorNotEqual(IRNode *Vector1, IRNode *Vector2) override;
+  IRNode *vectorMax(IRNode *Vector1, IRNode *Vector2, bool IsSigned) override;
+  IRNode *vectorMin(IRNode *Vector1, IRNode *Vector2, bool IsSigned) override;
+
+  llvm::Type *getVectorIntType(unsigned VectorByteSize);
+
+  IRNode *vectorBitOr(IRNode *Vector1, IRNode *Vector2,
+                      unsigned VectorByteSize) override;
+  IRNode *vectorBitAnd(IRNode *Vector1, IRNode *Vector2,
+                       unsigned VectorByteSize) override;
+  IRNode *vectorBitExOr(IRNode *Vector1, IRNode *Vector2,
+                        unsigned VectorByteSize) override;
+  IRNode *vectorAbs(IRNode *Vector) override;
+  IRNode *vectorSqrt(IRNode *Vector) override;
+
+  bool isVectorType(IRNode *Arg) override;
+
+  bool checkVectorSignature(std::vector<IRNode *> Args,
+                            std::vector<llvm::Type *> Types);
+
+  IRNode *vectorFixType(IRNode *Arg, llvm::Type *DstType);
+
+  IRNode *vectorCtor(CORINFO_CLASS_HANDLE Class, IRNode *This,
+                     std::vector<IRNode *> Args) override;
+  IRNode *vectorCtorFromOne(int VectorSize, IRNode *This,
+                            std::vector<IRNode *> Args);
+  IRNode *vectorCtorFromFloats(int VectorSize, IRNode *This,
+                               std::vector<IRNode *> Args);
+  IRNode *vectorCtorFromArray(int VectorSize, IRNode *Vector, IRNode *Array,
+                              IRNode *Index);
+  IRNode *vectorCtorFromPointer(int VectorSize, IRNode *Vector, IRNode *Pointer,
+                                IRNode *Index);
+
+  IRNode *vectorGetCount(CORINFO_CLASS_HANDLE Class) override;
+
+  IRNode *vectorGetItem(IRNode *VectorPointer, IRNode *Index,
+                        CorInfoType ResType) override;
+
+  /// Get information corresponding to the handle.
+  ///
+  /// \param Class                     The handle to get a type for.
+  /// \param VectorLength              Return vector length in elements.
+  /// \param IsGeneric                 Return is it generic vector or vector
+  ///                                  with fixed size.
+  /// \param IsSigned                  Return is it signed type or not.
+  /// \returns                         Type corresponding to the handle.
+  llvm::Type *getBaseTypeAndSizeOfSIMDType(CORINFO_CLASS_HANDLE Class,
+                                           int &VectorLength, bool &IsGeneric,
+                                           bool &IsSigned);
+
+  IRNode *generateIsHardwareAccelerated(CORINFO_CLASS_HANDLE Class) override;
+
+  unsigned getMaxIntrinsicSIMDVectorLength(CORINFO_CLASS_HANDLE Class) override;
+
+  int getElementCountOfSIMDType(CORINFO_CLASS_HANDLE Class) override;
+  bool getIsSigned(CORINFO_CLASS_HANDLE Class) override;
+
+  /// Create the IR for a finally dispatch.
+  ///
+  /// Creates an alloca for the selector variable, and then a load and switch
+  /// on the selector value. The load and switch are not inserted into any
+  /// block. Sets the region's switch to the switch.
+  ///
+  /// \param FinallyRegion         Finally region needing dispatch IR.
+  /// \returns                     Dispatch switch instruction.
+  llvm::SwitchInst *createFinallyDispatch(EHRegion *FinallyRegion);
+
+  /// Copy the IR in each finally so that the exceptional path does not share
+  /// code with the non-exceptional path.
+  void cloneFinallyBodies();
+
+  /// Copy the IR in the given finally so that the exceptional path does not
+  /// share code with the non-exceptional path.
+  ///
+  /// \param FinallyRegion  The region whose IR is to be cloned.
+  void cloneFinallyBody(EHRegion *FinallyRegion);
+
+  /// Determine whether the IR generated for the given handler should be
+  /// allowed to execute (as opposed to inserting a failfast at handler entry).
+  /// Does not affect non-exceptional executions of finally handlers.
+  ///
+  /// \param Handler  The catchpad/cleanuppad for the handler.
+  bool canExecuteHandler(llvm::BasicBlock &Handler);
+
 private:
   LLILCJitContext *JitContext;
   ABIInfo *TheABIInfo;
   ReaderMethodSignature MethodSignature;
   ABIMethodSignature ABIMethodSig;
-  llvm::Function *Function;
+  llvm::Function *Function; // The current function being read
+  ::GcFuncInfo *GcFuncInfo; // GcInfo for the above function
   // The LLVMBuilder has a notion of a current insertion point.  During the
   // first-pass flow-graph construction, each method sets the insertion point
   // explicitly before inserting IR (the fg- methods typically take an
@@ -1239,27 +1760,83 @@ private:
   // where they should be inserted (the gen- methods do not take explicit
   // insertion point parameters).
   llvm::IRBuilder<> *LLVMBuilder;
+  llvm::DIBuilder *DBuilder;
   std::map<CORINFO_CLASS_HANDLE, llvm::Type *> *ClassTypeMap;
   std::map<llvm::Type *, CORINFO_CLASS_HANDLE> *ReverseClassTypeMap;
   std::map<CORINFO_CLASS_HANDLE, llvm::Type *> *BoxedTypeMap;
-  std::map<std::tuple<CorInfoType, CORINFO_CLASS_HANDLE, uint32_t>,
+  std::map<std::tuple<CorInfoType, CORINFO_CLASS_HANDLE, uint32_t, bool>,
            llvm::Type *> *ArrayTypeMap;
   std::map<CORINFO_FIELD_HANDLE, uint32_t> *FieldIndexMap;
+  llvm::StringMap<uint64_t> *NameToHandleMap; ///< Map from GlobalObject names
+                                              ///< to handles corresponding to
+                                              ///< those GlobalObjects.
+  /// \brief Map from handles to global objects representing the handles.
+  std::map<uint64_t, llvm::GlobalObject *> HandleToGlobalObjectMap;
   std::map<llvm::BasicBlock *, FlowGraphNodeInfo> FlowGraphInfoMap;
   std::vector<llvm::Value *> LocalVars;
+  llvm::Value *UnmanagedCallFrame; ///< If the method contains unmanaged calls,
+                                   ///< this is the address of the unmanaged
+                                   ///< call frame.
+  llvm::Value *ThreadPointer;      ///< If the method contains unmanaged calls,
+                                   ///< this is the address of the pointer to
+                                   ///< the runtime thread.
   std::vector<CorInfoType> LocalVarCorTypes;
   std::vector<llvm::Value *> Arguments;
   llvm::Value *IndirectResult;
   llvm::DenseMap<uint32_t, llvm::StoreInst *> ContinuationStoreMap;
+  llvm::SmallPtrSet<llvm::Value *, 5> StructPointers; ///< This set contains
+                                                      ///< pointers to structs
+                                                      ///< that we create
+                                                      ///< to represent structs
+                                                      ///< since we don't allow
+                                                      ///< first-class
+                                                      ///< aggregates in LLVM IR
+                                                      ///< we are generating.
   FlowGraphNode *FirstMSILBlock;
   llvm::BasicBlock *UnreachableContinuationBlock;
+  llvm::Function *PersonalityFunction; ///< Personality routine reported on
+                                       ///< LandingPads in this function.
+                                       ///< Lazily created/cached.
   bool KeepGenericContextAlive;
+  bool NeedsStackSecurityCheck;
   bool NeedsSecurityObject;
+  bool DoneBuildingFlowGraph;
   llvm::BasicBlock *EntryBlock;
-  llvm::Instruction *TempInsertionPoint;
+  llvm::Instruction *AllocaInsertionPoint; ///< Position in the Prolog where
+                                           ///< Alloca instructions should be
+                                           ///< inserted after the
+                                           ///< reader-pre-pass
+  IRNode *MethodSyncHandle; ///< If the method is synchronized, this is
+                            ///< the handle used for entering and exiting
+                            ///< the monitor.
+  llvm::Value *SyncFlag;    ///< For synchronized methods this flag
+                            ///< indicates whether the monitor has been
+                            ///< entered. It is set and checked by monitor
+                            ///< helpers.
   uint32_t TargetPointerSizeInBits;
-  const uint32_t UnmanagedAddressSpace = 0;
-  const uint32_t ManagedAddressSpace = 1;
+  llvm::Type *BuiltinObjectType; ///< Cached LLVM representation of object.
+
+  /// \brief Map from Element types to the LLVM representation of the
+  /// MSIL array type that has that element type.
+  std::map<llvm::Type *, llvm::PointerType *> ElementToArrayTypeMap;
+
+  static const uint32_t ArrayIntrinMaxRank = 3; ///< This constant determines
+                                                ///< the maximum rank of an
+                                                ///< array access that we will
+                                                ///< generate code for.
+                                                ///< If the rank is larger,
+                                                ///< we'll call the runtime's
+                                                ///< helper function.
+                                                ///< This constant is from the
+                                                ///< legacy jit.
+  struct DebugInfo {
+    llvm::DICompileUnit *TheCU;
+    llvm::DIScope *FunctionScope;
+  } LLILCDebugInfo;
+
+  /// \brief Map from llvm vector types for SIMD vector types
+  /// to llvm struct type.
+  std::map<llvm::Type *, llvm::Type *> VectorTypeToStructType;
 };
 
 #endif // MSIL_READER_IR_H

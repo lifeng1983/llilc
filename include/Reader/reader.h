@@ -47,12 +47,7 @@
 // Debugging
 // -----------------------------------------------------------------
 
-#define ASSERTM(Predicate, Message)                                            \
-  do {                                                                         \
-    if (!(Predicate)) {                                                        \
-      ReaderBase::debugError(__FILE__, __LINE__, Message);                     \
-    }                                                                          \
-  } while (0)
+#define ASSERTM(Predicate, Message) assert((Predicate) && Message)
 #define ASSERT(Predicate) ASSERTM(Predicate, #Predicate)
 #define UNREACHED 0
 #ifndef _MSC_VER
@@ -136,56 +131,7 @@ extern "C"
     jitFilter(PEXCEPTION_POINTERS ExceptionPointersPtr, void *Param);
 extern void _cdecl fatal(int Errnum, ...);
 
-// Global environment config variables (set by GetConfigString).
-// These are defined/set in jit.cpp.
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-extern uint32_t EnvConfigCseOn;
-#ifndef NDEBUG
-extern uint32_t EnvConfigCseBinarySearch;
-extern uint32_t EnvConfigCseMax;
-extern uint32_t EnvConfigCopyPropMax;
-extern uint32_t EnvConfigDeadCodeMax;
-extern uint32_t EnvConfigCseStats;
-#endif // !NDEBUG
-#if !defined(CC_PEVERIFY)
-extern uint32_t EnvConfigTailCallOpt;
-#if !defined(NODEBUG)
-extern uint32_t EnvConfigDebugVerify;
-extern uint32_t EnvConfigTailCallMax;
-#endif // !NODEBUG
-#endif // !CC_PEVERIFY
-extern uint32_t EnvConfigPInvokeInline;
-extern uint32_t EnvConfigPInvokeCalliOpt;
-extern uint32_t EnvConfigNewGCCalc;
-extern uint32_t EnvConfigTurnOffDebugInfo;
-extern char16_t *EnvConfigJitName;
-
-extern bool HaveEnvConfigCseOn;
-extern bool HaveEnvConfigCseStats;
-#ifndef NDEBUG
-extern bool HaveEnvConfigCseBinarySearch;
-extern bool HaveEnvConfigCseMax;
-extern bool HaveEnvConfigCopyPropMax;
-extern bool HaveEnvConfigDeadCodeMax;
-#endif // !NDEBUG
-#if !defined(CC_PEVERIFY)
-extern bool HaveEnvConfigTailCallOpt;
-#if !defined(NODEBUG)
-extern bool HaveEnvConfigDebugVerify;
-extern bool HaveEnvConfigTailCallMax;
-#endif // !NODEBUG
-#endif // !CC_PEVERIFY
-extern bool HaveEnvConfigPInvokeInline;
-extern bool HaveEnvConfigPInvokeCalliOpt;
-extern bool HaveEnvConfigNewGCCalc;
-extern bool HaveEnvConfigTurnOffDebugInfo;
-extern bool HaveEnvConfigJitName;
-
-} // extern "C"
+// Environment config variables
 
 #ifdef CC_PEVERIFY
 extern HRESULT VerLastError;
@@ -196,7 +142,6 @@ class GenIR;  // Compiler dependent IR production
 class IRNode; // Your compiler intermediate representation
 class ReaderStack;
 class FlowGraphNode;
-class FlowGraphEdgeList;
 class BranchList;
 class ReaderBitVector;
 struct EHRegion;
@@ -232,7 +177,7 @@ struct RuntimeFilterParams {
 /// actually has GC pointers, so \p NumGCPtrs should be nonzero.
 struct GCLayout {
   uint32_t NumGCPointers; ///< Total number of gc pointers to report
-  uint8_t GCPointers[0];  ///< Array indicating location of the gc pointers
+  uint8_t GCPointers[1];  ///< Array indicating location of the gc pointers
 };
 
 /// \brief Structure that encapsulates type information for the values passed to
@@ -306,6 +251,26 @@ enum ReaderExceptionType {
   Reader_GlobalVerificationException, ///< Verifier global check failed
 };
 
+enum ReaderSIMDIntrinsic {
+  UNDEF,
+  CTOR,
+  ADD,
+  SUB,
+  MUL,
+  DIV,
+  MIN,
+  MAX,
+  BITOR,
+  BITAND,
+  BITEXOR,
+  ABS,
+  SQRT,
+  EQ,
+  NEQ,
+  GETCOUNTOP,
+  GETITEM
+};
+
 /// Common base class for reader exceptions
 class ReaderException {
 public:
@@ -343,6 +308,9 @@ protected:
   std::vector<IRNode *> Stack;
 
 public:
+  /// \brief Destructor
+  virtual ~ReaderStack() {}
+
   /// \brief Mutable iterator to elements of the stack from bottom to top.
   ///
   /// This is the same as the underlying vector iterator.
@@ -382,7 +350,7 @@ public:
   /// \brief Return begin iterator for iterating from bottom to top of stack.
   iterator begin() { return Stack.begin(); }
 
-  /// \brief Return begin iterator for iterating from bottom to top of stack.
+  /// \brief Return end iterator for iterating from bottom to top of stack.
   iterator end() { return Stack.end(); }
 
 #if defined(_DEBUG)
@@ -468,10 +436,21 @@ public:
   /// \returns True if this method accepts instantiation information.
   bool hasTypeArg() const { return HasTypeArg; }
 
-  /// \brief Check whether this method acceps a secret parameter.
+  /// \brief Check whether this method accepts a secret parameter.
   ///
   /// \returns True if this method accepts a secret parameter.
   bool hasSecretParameter() const { return HasSecretParameter; }
+
+  /// \brief Get the index of the method's secret parameter.
+  ///
+  /// The result of this method can be used as an index into the
+  /// result of \p getArgumentTypes.
+  ///
+  /// \returns The index of the method's secret parameter.
+  uint32_t getSecretParameterIndex() const {
+    assert(HasSecretParameter);
+    return 0;
+  }
 
   /// \brief Get the index of the method's \p this parameter.
   ///
@@ -481,7 +460,7 @@ public:
   /// \returns The index of the method's \p this parameter.
   uint32_t getThisIndex() const {
     assert(HasThis);
-    return 0;
+    return HasSecretParameter ? 1 : 0;
   }
 
   /// \brief Get the index of the method's vararg cookie parameter.
@@ -492,7 +471,7 @@ public:
   /// \returns The index of the method's vararg cookie parameter.
   uint32_t getVarArgIndex() const {
     assert(IsVarArg);
-    return HasThis ? 1 : 0;
+    return (HasSecretParameter ? 1 : 0) + (HasThis ? 1 : 0);
   }
 
   /// \brief Get the index of the method's instantiation parameter.
@@ -503,18 +482,8 @@ public:
   /// \returns The index of the method's instantiation parameter.
   uint32_t getTypeArgIndex() const {
     assert(HasTypeArg);
-    return (HasThis ? 1 : 0) + (IsVarArg ? 1 : 0);
-  }
-
-  /// \brief Get the index of the method's secret parameter.
-  ///
-  /// The result of this method can be used as an index into the
-  /// result of \p getArgumentTypes.
-  ///
-  /// \returns The index of the method's secret parameter.
-  uint32_t getSecretParameterIndex() const {
-    assert(HasSecretParameter);
-    return ArgumentTypes.size() - 1;
+    return (HasSecretParameter ? 1 : 0) + (HasThis ? 1 : 0) +
+           (IsVarArg ? 1 : 0);
   }
 
   /// \brief Get the index of the method's first normal parameter.
@@ -531,17 +500,16 @@ public:
   ///
   /// \returns The index of the method's first normal parameter.
   uint32_t getNormalParamStart() const {
-    return (HasThis ? 1 : 0) + (IsVarArg ? 1 : 0) + (HasTypeArg ? 1 : 0);
+    return (HasSecretParameter ? 1 : 0) + (HasThis ? 1 : 0) +
+           (IsVarArg ? 1 : 0) + (HasTypeArg ? 1 : 0);
   }
 
   /// \brief Get the index after the last normal parameter to the method.
   ///
-  /// See \p getIndexOfFirstNormalParam for a discussion of "normal" parameters.
+  /// See \p getNormalParamStart for a discussion of "normal" parameters.
   ///
   /// \returns The index after the last normal parameter to this method.
-  uint32_t getNormalParamEnd() const {
-    return ArgumentTypes.size() - (HasSecretParameter ? 1 : 0);
-  }
+  uint32_t getNormalParamEnd() const { return ArgumentTypes.size(); }
 
   /// \brief Return the index of the argument that corresponds to the given
   ///        IL argument ordinal.
@@ -554,9 +522,10 @@ public:
   /// \returns The index of the argument.
   uint32_t getArgIndexForILArg(uint32_t Ordinal) const {
     if (HasThis && Ordinal == 0) {
-      return 0;
+      return getThisIndex();
     }
-    uint32_t Index = Ordinal + (IsVarArg ? 1 : 0) + (HasTypeArg ? 1 : 0);
+    uint32_t Index = Ordinal + (HasSecretParameter ? 1 : 0) +
+                     (IsVarArg ? 1 : 0) + (HasTypeArg ? 1 : 0);
     assert(Index >= getNormalParamStart());
     assert(Index < getNormalParamEnd());
     return Index;
@@ -565,16 +534,17 @@ public:
   /// \brief Return the IL argument ordinal that corresponds to the given
   ///        index.
   ///
-  /// \
+  /// \param Index  The index of the argument in the current argument list.
   ///
   /// \returns The IL argument ordinal.
   uint32_t getILArgForArgIndex(uint32_t Index) const {
-    if (HasThis && Index == 0) {
+    if (HasThis && Index == getThisIndex()) {
       return 0;
     }
     assert(Index >= getNormalParamStart());
     assert(Index < getNormalParamEnd());
-    return Index - (IsVarArg ? 1 : 0) - (HasTypeArg ? 1 : 0);
+    return Index - (HasSecretParameter ? 1 : 0) - (IsVarArg ? 1 : 0) -
+           (HasTypeArg ? 1 : 0);
   }
 };
 
@@ -767,6 +737,12 @@ public:
   /// \returns      Specified client IR, or nullptr if none.
   IRNode *getTypeContextNode();
 
+  /// Get the client IR for the type context when compiling in ReadyToRun mode.
+  /// \param Token Method or class token.
+  /// \param CompileHandle Method or class handle.
+  /// \returns      Specified client IR.
+  IRNode *getReadyToRunTypeContextNode(mdToken Token, void *CompileHandle);
+
   /// \brief Modify the \p this parameter as necessary at the call site.
   ///
   /// Certain calls may require indirection or boxing to obtain the proper
@@ -895,12 +871,6 @@ public:
   /// \returns    Token for the delegate constructor.
   mdToken getLoadFtnToken() { return LoadFtnToken; }
 
-  /// Set the token for the delegate constructor when the reader has detected
-  /// the ldftn/newobj delegate construction pattern.
-  ///
-  /// \param Token    Token for the delegate constructor.
-  void setLoadFtnToken(mdToken Token) { LoadFtnToken = Token; }
-
   /// \brief Check if this is a basic call to the target.
   ///
   /// If the client knows that this call is a direct call to the target
@@ -986,46 +956,29 @@ uint32_t rgnGetStartMSILOffset(EHRegion *EhRegion);
 void rgnSetStartMSILOffset(EHRegion *EhRegion, uint32_t Offset);
 uint32_t rgnGetEndMSILOffset(EHRegion *EhRegion);
 void rgnSetEndMSILOffset(EHRegion *EhRegion, uint32_t Offset);
-IRNode *rgnGetHead(EHRegion *EhRegion);
-void rgnSetHead(EHRegion *EhRegion, IRNode *Head);
-IRNode *rgnGetLast(EHRegion *EhRegion);
-void rgnSetLast(EHRegion *EhRegion, IRNode *Last);
-bool rgnGetIsLive(EHRegion *EhRegion);
-void rgnSetIsLive(EHRegion *EhRegion, bool Live);
 void rgnSetParent(EHRegion *EhRegion, EHRegion *Parent);
 EHRegion *rgnGetParent(EHRegion *EhRegion);
+/// \brief Determine if this region is lexically outside its parent in the tree
+///
+/// Handler regions are children of the \p try regions they protect in the
+/// region tree, but lexically they come after (not inside) the protected
+/// region.  This routine identifies them.
+///
+/// \param Region   The child region to check against its parent
+/// \returns True iff this region is lexically outside its parent
+bool rgnIsOutsideParent(EHRegion *Region);
+EHRegion *rgnGetEnclosingAncestor(EHRegion *Region);
 void rgnSetChildList(EHRegion *EhRegion, EHRegionList *Children);
 EHRegionList *rgnGetChildList(EHRegion *EhRegion);
-bool rgnGetHasNonLocalFlow(EHRegion *EhRegion);
-void rgnSetHasNonLocalFlow(EHRegion *EhRegion, bool NonLocalFlow);
-IRNode *rgnGetEndOfClauses(EHRegion *EhRegion);
-void rgnSetEndOfClauses(EHRegion *EhRegion, IRNode *Node);
-IRNode *rgnGetTryBodyEnd(EHRegion *EhRegion);
-void rgnSetTryBodyEnd(EHRegion *EhRegion, IRNode *Node);
-ReaderBaseNS::TryKind rgnGetTryType(EHRegion *EhRegion);
-void rgnSetTryType(EHRegion *EhRegion, ReaderBaseNS::TryKind Type);
-int rgnGetTryCanonicalExitOffset(EHRegion *TryRegion);
-void rgnSetTryCanonicalExitOffset(EHRegion *TryRegion, int32_t Offset);
-EHRegion *rgnGetExceptFilterRegion(EHRegion *EhRegion);
-void rgnSetExceptFilterRegion(EHRegion *EhRegion, EHRegion *FilterRegion);
-EHRegion *rgnGetExceptTryRegion(EHRegion *EhRegion);
-void rgnSetExceptTryRegion(EHRegion *EhRegion, EHRegion *TryRegion);
-bool rgnGetExceptUsesExCode(EHRegion *EhRegion);
-void rgnSetExceptUsesExCode(EHRegion *EhRegion, bool UsesExceptionCode);
-EHRegion *rgnGetFilterTryRegion(EHRegion *EhRegion);
-void rgnSetFilterTryRegion(EHRegion *EhRegion, EHRegion *TryRegion);
 EHRegion *rgnGetFilterHandlerRegion(EHRegion *EhRegion);
 void rgnSetFilterHandlerRegion(EHRegion *EhRegion, EHRegion *Handler);
 EHRegion *rgnGetFinallyTryRegion(EHRegion *FinallyRegion);
-void rgnSetFinallyTryRegion(EHRegion *FinallyRegion, EHRegion *TryRegion);
-bool rgnGetFinallyEndIsReachable(EHRegion *FinallyRegion);
-void rgnSetFinallyEndIsReachable(EHRegion *FinallyRegion, bool IsReachable);
-EHRegion *rgnGetFaultTryRegion(EHRegion *FinallyRegion);
-void rgnSetFaultTryRegion(EHRegion *FinallyRegion, EHRegion *TryRegion);
-EHRegion *rgnGetCatchTryRegion(EHRegion *CatchRegion);
-void rgnSetCatchTryRegion(EHRegion *CatchRegion, EHRegion *TryRegion);
 mdToken rgnGetCatchClassToken(EHRegion *CatchRegion);
 void rgnSetCatchClassToken(EHRegion *CatchRegion, mdToken Token);
+/// A try region's "entry region" is either the try region itself or one of
+/// its handlers; whichever from that set comes lexically first.
+void rgnSetEntryRegion(EHRegion *TryRegion, EHRegion *EntryRegion);
+EHRegion *rgnGetEntryRegion(EHRegion *TryRegion);
 
 /// Get the finally region attached to the given \p TryRegion, if any.
 ///
@@ -1033,38 +986,165 @@ void rgnSetCatchClassToken(EHRegion *CatchRegion, mdToken Token);
 /// \returns The finally protecting this try if it exists; else nullptr
 EHRegion *getFinallyRegion(EHRegion *TryRegion);
 
-// Interface to GenIR defined Flow Graph structures.
-// Implementation Supplied by Jit Client
-EHRegion *fgNodeGetRegion(FlowGraphNode *FgNode);
-void fgNodeSetRegion(FlowGraphNode *FgNode, EHRegion *EhRegion);
-FlowGraphEdgeList *fgNodeGetSuccessorList(FlowGraphNode *FgNode);
-FlowGraphEdgeList *fgNodeGetPredecessorList(FlowGraphNode *FgNode);
+/// \name Client Flow Graph interface
+///
+///@{
 
-// Get the special block-start placekeeping node
+/// \brief Class implementing an iterable list of flow graph edges.
+///
+/// Abstract class that serves as a common base for the client-supplied
+/// predecessor and successor iterator implementations.
+class FlowGraphEdgeIteratorImpl {
+public:
+  /// \brief Check if the iterator is at end.
+  ///
+  /// \returns True if there are no more edges to iterate.
+  virtual bool isEnd() = 0;
+
+  /// \brief Advance the iterato
+  virtual void moveNext() = 0;
+
+  /// \brief Obtain the sink for the current edge.
+  /// \returns The sink (aka target or destination) node of the current edge.
+  virtual FlowGraphNode *getSink() = 0;
+
+  /// \brief Obtain the source for the current edge.
+  /// \return The source (aka From) node of the current edge.
+  virtual FlowGraphNode *getSource() = 0;
+};
+
+/// \brief Class representing an iterable list of flow graph edges.
+///
+/// An iterator for flow graph edges that does not assume there is an actual
+/// object representing the edge. At construction time specify whether the
+/// iterator can traverse the successor or predecessor edges of a block.
+class FlowGraphEdgeIterator {
+public:
+  /// \brief Construct an iterator, given an impl.
+  ///
+  /// \param Impl  FlowGraphEdgeIteratorImpl that will implement the interface.
+  FlowGraphEdgeIterator(std::unique_ptr<FlowGraphEdgeIteratorImpl> Impl)
+      : Impl(std::move(Impl)) {}
+
+  /// \brief Move-Construct an iterator from an rvalue reference.
+  /// \param Other   Temporary iterator to copy state from.
+  FlowGraphEdgeIterator(FlowGraphEdgeIterator &&Other)
+      : Impl(std::move(Other.Impl)) {}
+
+  FlowGraphEdgeIterator(const FlowGraphEdgeIterator &) = delete;
+  FlowGraphEdgeIterator &operator=(const FlowGraphEdgeIterator &) = delete;
+
+  /// \brief Check if the iterator is at end.
+  ///
+  /// \returns True if there are no more edges to iterate.
+  bool isEnd() { return Impl->isEnd(); }
+
+  /// \brief Advance the iterator.
+  void moveNext() { Impl->moveNext(); }
+
+  /// \brief Obtain the sink for the current edge.
+  /// \returns The sink (aka target or destination) node of the current edge.
+  FlowGraphNode *getSink() { return Impl->getSink(); }
+
+  /// \brief Obtain the source for the current edge.
+  /// \return The source (aka From) node of the current edge.
+  FlowGraphNode *getSource() { return Impl->getSource(); }
+
+private:
+  std::unique_ptr<FlowGraphEdgeIteratorImpl> Impl;
+};
+
+/// \brief Get the IRNode that is the label for a flow graph node.
+///
+/// \param  FgNode  The FlowGraphNode of interest.
+/// \returns        The label for the flow graph node.
 IRNode *fgNodeGetStartIRNode(FlowGraphNode *FgNode);
 
-// Get the first non-placekeeping node in block
+/// \brief Get the first insertion point IR node in a flow graph node.
+///
+/// \param  FgNode  The FlowGraphNode of interest.
+/// \returns        The first insertion point.
 IRNode *fgNodeGetStartInsertIRNode(FlowGraphNode *FgNode);
 
+/// \brief Get the global verification data for a flow graph node.
+///
+/// \param  FgNode  The FlowGraphNode of interest.
+/// \returns        The global verification data for the node.
 GlobalVerifyData *fgNodeGetGlobalVerifyData(FlowGraphNode *Fg);
+
+/// \brief Set the global verification data for a flow graph node.
+///
+/// \param  FgNode  The FlowGraphNode of interest.
+/// \param  GvData  The global verification data to associate.
 void fgNodeSetGlobalVerifyData(FlowGraphNode *Fg, GlobalVerifyData *GvData);
 
+/// \brief Get this flow graph node's number.
+///
+/// \param  FgNode  The FlowGraphNode of interest.
+/// \returns        Number in range [0, number of blocks] unique to this node.
 uint32_t fgNodeGetBlockNum(FlowGraphNode *Fg);
 
-FlowGraphEdgeList *fgEdgeListGetNextSuccessor(FlowGraphEdgeList *FgEdge);
-FlowGraphEdgeList *fgEdgeListGetNextPredecessor(FlowGraphEdgeList *FgEdge);
-FlowGraphNode *fgEdgeListGetSource(FlowGraphEdgeList *FgEdge);
-FlowGraphNode *fgEdgeListGetSink(FlowGraphEdgeList *FgEdge);
-bool fgEdgeListIsNominal(FlowGraphEdgeList *FgEdge);
+/// \brief Check if an iterator is at the end of its iteration range.
+///
+/// \param Iterator  The iterator in question.
+/// \returns         True if the iterator is not yet at the end.
+bool fgEdgeIteratorIsEnd(FlowGraphEdgeIterator &Iterator);
+
+/// \brief Advance a flow graph iterator to the next successor edge.
+///
+/// \param Iterator  The iterator in question.
+/// \returns         False if there are no more successor edges.
+bool fgEdgeIteratorMoveNextSuccessor(FlowGraphEdgeIterator &Iterator);
+
+/// \brief Advance a flow graph  iterator to the next predecessor edge.
+///
+/// \param Iterator  The iterator in question.
+/// \returns         False if there are no more predecessor edges.
+bool fgEdgeIteratorMoveNextPredecessor(FlowGraphEdgeIterator &Iterator);
+
+/// \brief Get the source flow graph node for the iterator's current edge.
+///
+/// \param  Iterator The iterator in question.
+/// \returns         The source FlowGraphNode.
+FlowGraphNode *fgEdgeIteratorGetSource(FlowGraphEdgeIterator &Iterator);
+
+/// \brief Get the sink flow graph node for the iterator's current edge.
+///
+/// \param  Iterator The iterator in question.
+/// \returns         The sink FlowGraphNode.
+FlowGraphNode *fgEdgeIteratorGetSink(FlowGraphEdgeIterator &Iterator);
+
+/// \brief Determine if the iterator's current edge represents exceptional
+/// control flow.
+///
+/// \param  Iterator The iterator in question.
+/// \returns         True if iterator's current edge describes exceptional flow.
+bool fgEdgeIsNominal(FlowGraphEdgeIterator &Iterator);
+
 #ifdef CC_PEVERIFY
-void fgEdgeListMakeFake(FlowGraphEdgeList *FgEdge);
+/// \brief Mark the iterator's current edge as representing fake control flow
+/// added to ensureall blocks are reachable from the head block.
+///
+/// \param   Iterator  The iterator in question.
+void fgEdgeListMakeFake(FlowGraphEdgeIterator &FgEdgeIterator);
 #endif
 
-FlowGraphEdgeList *fgEdgeListGetNextSuccessorActual(FlowGraphEdgeList *FgEdge);
-FlowGraphEdgeList *
-fgEdgeListGetNextPredecessorActual(FlowGraphEdgeList *FgEdge);
-FlowGraphEdgeList *fgNodeGetSuccessorListActual(FlowGraphNode *Fg);
-FlowGraphEdgeList *fgNodeGetPredecessorListActual(FlowGraphNode *Fg);
+/// \brief Advance a successor edge iterator to the next edge that represents
+/// actual (non-exceptional) control flow.
+///
+/// \param Iterator  The iterator in question.
+/// \returns         False if there are no more non-exceptional edges.
+bool fgEdgeIteratorMoveNextSuccessorActual(FlowGraphEdgeIterator &Iterator);
+
+/// \brief Advance a predecessor edge iterator to the next edge that represents
+/// actual (non-exceptional) control flow.
+///
+/// \param Iterator  The iterator in question.
+/// \returns         False if there are no more non-exceptional edges.
+bool fgEdgeIteratorMoveNextPredecessorActual(
+    FlowGraphEdgeIterator &FgEdgeIterator);
+
+///@}
 
 /// \name Client IR interface
 ///
@@ -1121,12 +1201,6 @@ uint32_t irNodeGetMSILOffset(IRNode *Node);
 /// \param Offset    The MSIL offset to use
 void irNodeLabelSetMSILOffset(IRNode *Node, uint32_t Offset);
 
-/// Set the MSIL offset for this branch IR node
-///
-/// \param BranchNode      The node in question
-/// \param Offset          The MSIL offset to use
-void irNodeBranchSetMSILOffset(IRNode *BranchNode, uint32_t Offset);
-
 /// Set the MSIL offset for this exception branch IR node.
 ///
 /// \param BranchNode      The node in question
@@ -1144,12 +1218,6 @@ void irNodeInsertBefore(IRNode *InsertionPoint, IRNode *NewNode);
 /// \param InsertionPoint    Existing IR to use as insertion point
 /// \param NewNode           New IR to insert after \p InsertionPoint
 void irNodeInsertAfter(IRNode *InsertionPoint, IRNode *NewNode);
-
-/// Set the EH region for an IR node
-///
-/// \param Node        The IR node of interest
-/// \param Region      The EH region to associate with the \p Node
-void irNodeSetRegion(IRNode *Node, EHRegion *Region);
 
 /// Get the EH region for an IR node
 ///
@@ -1186,25 +1254,6 @@ bool irNodeIsEHFlowAnnotation(IRNode *Node);
 /// \param Node       The IR node of interest
 /// \returns          True iff \p Node is an EH handler flow annotation
 bool irNodeIsHandlerFlowAnnotation(IRNode *Node);
-
-///@}
-
-/// \name Client BranchList interface
-/// Used by \p fgFixRecursiveEdges to undo branches added by the optimistic
-/// recursive tail call transformation. Implementation supplied by the client.
-///@{
-
-/// Get the next branch list item
-///
-/// \param BranchList    Current list item
-/// \returns             Next list item
-BranchList *branchListGetNext(BranchList *BranchList);
-
-/// Get the client IR for a branch list item
-///
-/// \param BranchList    Current list item
-/// \returns             Client IR for the item
-IRNode *branchListGetIRNode(BranchList *BranchList);
 
 ///@}
 
@@ -1274,6 +1323,7 @@ public:
   // The reader's operand stack. Public because of inlining and debug prints
   ReaderStack *ReaderOperandStack;
 
+  // Used in both first and second pass
   // Public for debug printing
   EHRegion *CurrentRegion;
 
@@ -1282,9 +1332,8 @@ public:
   /// True if this method contains the 'localloc' MSIL opcode.
   bool HasLocAlloc;
 
-  /// True if the client has optimistically transformed tail.
-  /// recursion into a branch.
-  bool HasOptimisticTailRecursionTransform;
+  /// True if this method takes a local or argument's address.
+  bool HasAddressTaken;
 
   /// The current instruction's IL offset.
   uint32_t CurrInstrOffset;
@@ -1319,7 +1368,6 @@ protected:
   uint32_t CurrentBranchDepth;
 
   // EH Info
-  CORINFO_EH_CLAUSE *EhClauseInfo; // raw eh clause info
   EHRegion *EhRegionTree;
   EHRegionList *AllRegionList;
 
@@ -1338,6 +1386,14 @@ protected:
   // configuration flag to facilitate experimenting with what the IR/codegen
   // could look like with divide-by-zero checks folded onto divides.
   static const bool UseExplicitZeroDivideChecks = true;
+
+  /// \brief Suppresses generation of code to handle exceptions
+  ///
+  /// This flag can be used when bringing up a new runtime target that doesn't
+  /// yet have exception handling support implemented.  If this flag is set,
+  /// no EH clauses will be reported to the runtime, but any code that doesn't
+  /// dynamically throw exceptions will be handled correctly.
+  static const bool SuppressExceptionHandlers = false;
 
   // Verification Info
 public:
@@ -1491,7 +1547,9 @@ public:
   FlowGraphNode *fgSplitBlock(FlowGraphNode *Block, uint32_t Offset,
                               IRNode *Node);
 
-#if defined(_DEBUG)
+  /// \brief Debug-only reader function to print MSIL of the current method.
+  void printMSIL();
+
   /// \brief Debug-only reader function to print range of MSIL.
   ///
   /// Print the MSIL in the buffer for the given range. Output emitted via
@@ -1500,8 +1558,7 @@ public:
   /// \param Buf           Buffer containing MSIL bytecode.
   /// \param StartOffset   Initial offset for the range to print.
   /// \param EndOffset     Ending offset for the range to print.
-  void printMSIL(uint8_t *Buf, uint32_t StartOffset, uint32_t EndOffset);
-#endif
+  static void printMSIL(uint8_t *Buf, uint32_t StartOffset, uint32_t EndOffset);
 
   /// \brief Determine the effect of this instruction on the operand stack.
   ///
@@ -1516,6 +1573,22 @@ public:
   /// \param Push [out] Number of operands pushed onto the stack.
   void getMSILInstrStackDelta(ReaderBaseNS::OPCODE Opcode, uint8_t *Operand,
                               uint16_t *Pop, uint16_t *Push);
+
+  /// \brief Check options to as to whether to do the tail call opt
+  ///
+  /// Derived class will provide an implementation that is correct for the
+  /// client.
+  ///
+  /// \returns true if tail call opt is enabled.
+  virtual bool doTailCallOpt() = 0;
+
+  /// \brief Check options to as to whether to use SIMD intrinsic.
+  ///
+  /// Derived class will provide an implementation that is correct for the
+  /// client.
+  ///
+  /// \returns true if simd intrinsic opt is enabled.
+  virtual bool doSimdIntrinsicOpt() = 0;
 
 private:
   /// \brief Determine if a call instruction is a candidate to be a tail call.
@@ -1594,12 +1667,12 @@ protected:
   FlowGraphNodeOffsetList *fgAddNodeMSILOffset(FlowGraphNode **Node,
                                                uint32_t TargetOffset);
 
-  /// Get the innermost finally region enclosing the given \p Offset.
+  /// Get the innermost fault or finally region enclosing the given \p Offset.
   ///
   /// \param Offset  MSIL offset of interest.
-  /// \returns The innermost finally region enclosing \p Offset if one exists;
-  ///          nullptr otherwise.
-  EHRegion *getInnermostFinallyRegion(uint32_t Offset);
+  /// \returns The innermost fault or finally region enclosing \p Offset if one
+  ///          exists; nullptr otherwise.
+  EHRegion *getInnermostFaultOrFinallyRegion(uint32_t Offset);
 
   /// Find the next-innermost region enclosing the given \p Offset.
   ///
@@ -1609,14 +1682,12 @@ protected:
   ///          that includes \p Offset, if such a region exists; else nullptr.
   EHRegion *getInnerEnclosingRegion(EHRegion *OuterRegion, uint32_t Offset);
 
-private:
-  /// \brief Perform special processing for blocks that start EH regions.
+  /// Process first entry to a region during 1st-pass flow-graph construction
   ///
-  /// Uses the \p CurrentFgNode to determine which block to process. Ensures
-  /// the operand stack and debugger info is in the proper state for blocks
-  /// that start EH regions.
-  void setupBlockForEH();
+  /// \param Region   \p EHRegion being entered
+  virtual void fgEnterRegion(EHRegion *Region) = 0;
 
+private:
   /// \brief Check if this offset is the start of an MSIL instruction.
   ///
   /// Helper used to check whether branch targets and similar are referring
@@ -1667,15 +1738,6 @@ private:
   /// \param HeadBlock   Initial block in the flow graph.
   void fgAttachGlobalVerifyData(FlowGraphNode *HeadBlock);
 
-  /// Perform special case repair for recursive tail call and localloc.
-  ///
-  /// The flow graph builder can optimistically describe recursive tail
-  /// calls as branches back to the start of the method. However this must
-  /// be undone if the method being compiled contains a localloc.
-  ///
-  /// \param HeadBlock   Initial block in the flow graph.
-  void fgFixRecursiveEdges(FlowGraphNode *HeadBlock);
-
   /// Helper method for building up the cases of a switch.
   ///
   /// \param SwitchNode    The client IR representing the switch.
@@ -1708,16 +1770,6 @@ private:
   /// \param Block          The block to delete
   void fgDeleteBlockAndNodes(FlowGraphNode *Block);
 
-  /// \brief Ensure the start of the current region includes all labels
-  ///        found right at the start of the region.
-  ///
-  /// Make sure that any instruction that targets this region via a
-  /// label is targeting the inside of the region, by moving the region
-  /// entry up before the labels as necessary.
-  ///
-  /// \param HandlerStartNode      First instruction in the region.
-  void fgEnsureEnclosingRegionBeginsWithLabel(IRNode *HandlerStartNode);
-
   /// \brief Get the innermost region that contains this MSIL offset
   ///
   /// Scan the EH regions of the method looking for the smallest region
@@ -1749,29 +1801,6 @@ private:
   /// refer to the proper blocks.
   void fgReplaceBranchTargets();
 
-  /// Process the end of a try region.
-  /// \param EhRegion   The region to process.
-  void fgInsertTryEnd(EHRegion *EhRegion);
-
-  /// Place client IR into the start of the EH region that begins at Offset.
-  ///
-  /// \param Offset        MSIL offset of the start of an EH region.
-  /// \param EHNode        Client IR to insert into the block that.
-  ///                      starts that region.
-  void fgInsertBeginRegionExceptionNode(uint32_t Offset, IRNode *EHNode);
-
-  /// Place client IR into the end of the EH region that ends at Offset.
-  ///
-  /// \param Offset        MSIL offset of the end of an EH region.
-  /// \param EHNode        Client IR to insert into the block that
-  ///                      ends that region.
-  void fgInsertEndRegionExceptionNode(uint32_t Offset, IRNode *EHNode);
-
-  /// Add client IR for an EH region and all contained regions.
-  ///
-  /// \param Region    Root region to process.
-  void fgInsertEHAnnotations(EHRegion *Region);
-
   /// \brief Create branch IR.
   ///
   /// Have the client create a branch to \p LabelNode from \p BlockNode.
@@ -1786,47 +1815,24 @@ private:
                              uint32_t Offset, bool IsConditional,
                              bool IsNominal);
 
-  /// \brief Create IR for an endfinally instruction.
-  ///
-  /// Have the client create IR for an endfinally instruction. Note
-  /// there can be more than one of these in a finally region.
-  ///
-  /// \param BlockNode     the block that is the end of the finally.
-  /// \param FinallyRegion the finally region being ended.
-  /// \param Offset        msil offset for the endfinally instruction.
-  /// \returns the branch generated to terminate the block for this endfinally.
-  IRNode *fgMakeEndFinallyHelper(IRNode *BlockNode, EHRegion *FinallyRegion,
-                                 uint32_t Offset);
-
   /// \brief Remove all unreachable blocks.
   ///
   /// Walk the flow graph and remove any block that cannot be reached from the
   /// head block. Blocks are removed by calling \p fgDeleteBlockAndNodes.
   ///
+  /// Clients can override this if they have their own global dead block
+  /// removal.
+  ///
   /// \param FgHead     the head block of the flow graph.
-  void fgRemoveUnusedBlocks(FlowGraphNode *FgHead);
+  virtual void fgRemoveUnusedBlocks(FlowGraphNode *FgHead);
 
-  /// Find the canonical landing point for leaves from an EH region.
+  /// \brief Remove all actual successor edges from this block.
   ///
-  /// \param Region    The region in question.
-  /// \returns         The MSIL offset of the canonical landing point.
-  uint32_t fgGetRegionCanonicalExitOffset(EHRegion *Region);
-
-  /// Buffer used by \p fgGetRegionCanonicalExitOffset for cases where
-  /// there are large amounts of MSIL for the method.
-  int32_t *FgGetRegionCanonicalExitOffsetBuff;
-
-  /// Determine if a leave exits the enclosing EH region in a non-local manner.
+  /// This method removes and deletes all actual successor edges of \p Block
+  /// from the flow graph.
   ///
-  /// \param Fg                           flow graph node containing the leave.
-  /// \param LeaveOffset                  MSIL offset of the leave.
-  /// \param LeaveTarget                  MSIL offset of the leave's target.
-  /// \param EndsWithNonLocalGoto [out]   Target of the leave is not the
-  ///                                     canonical exit offset of the region.
-  ///
-  /// \returns True if this is a nonlocal leave.
-  bool fgLeaveIsNonLocal(FlowGraphNode *Fg, uint32_t LeaveOffset,
-                         uint32_t LeaveTarget, bool *EndsWithNonLocalGoto);
+  /// \param Block          The block in question.
+  void fgRemoveAllActualSuccessorEdges(FlowGraphNode *Block);
 
   ///@}
 
@@ -1894,6 +1900,20 @@ private:
 
   void rgnCreateRegionTree(void);
   void rgnPushRegionChild(EHRegion *Parent, EHRegion *Child);
+
+  /// \brief Process a region transition during 1st-pass flow-graph construction
+  ///
+  /// Does any processing necessary for entering the new region and computes
+  /// the new current region and the MSIL offset where the next region
+  /// transition will occur (in a forward lexical walk).
+  ///
+  /// \param OldRegion   The region that was current before reaching \p Offset
+  /// \param Offset      The new MSIL offset reached in the lexical walk
+  /// \param NextOffset [out] The MSIL offset where the next region transition
+  ///                         after this one will occur (in the lexical walk)
+  /// \returns The innermost \p EHRegion enclosing \p Offset
+  EHRegion *fgSwitchRegion(EHRegion *OldRegion, uint32_t Offset,
+                           uint32_t *NextOffset);
 
 public:
   EHRegion *rgnMakeRegion(ReaderBaseNS::RegionKind Type, EHRegion *Parent,
@@ -2239,14 +2259,25 @@ private:
   void rdrMakeCallTargetNode(ReaderCallTargetData *CallTargetData,
                              IRNode **ThisPointer);
 
-  IRNode *rdrMakeLdFtnTargetNode(CORINFO_RESOLVED_TOKEN *ResolvedToken,
-                                 CORINFO_CALL_INFO *CallInfo);
-
   IRNode *rdrGetDirectCallTarget(ReaderCallTargetData *CallTargetData);
 
+  /// \brief Generate IR for getting the target of a direct call. "Direct call"
+  /// can either be a true direct call if the runtime allows, or it can be an
+  /// indirect call through the method descriptor.
+  ///
+  /// \param Method            Method handle.
+  /// \param MethodToken       Method token.
+  /// \param CodePointerLookup Info to get the address to call in ReadyToRun
+  ///                          mode.
+  /// \param NeedsNullCheck    True iff 'this' pointer is not guaranteed to be
+  ///                          non-null.
+  /// \param CanMakeDirectCall True iff a true direct call can be generated.
+  ///
+  /// \returns An \p IRNode that represents the target of the direct call.
   IRNode *rdrGetDirectCallTarget(CORINFO_METHOD_HANDLE Method,
-                                 mdToken MethodToken, bool NeedsNullCheck,
-                                 bool CanMakeDirectCall);
+                                 mdToken MethodToken,
+                                 CORINFO_LOOKUP CodePointerLookup,
+                                 bool NeedsNullCheck, bool CanMakeDirectCall);
   IRNode *
   rdrGetCodePointerLookupCallTarget(ReaderCallTargetData *CallTargetData);
 
@@ -2273,7 +2304,20 @@ private:
                                      IRNode **ThisPtr);
 
 public:
-  void rdrCallFieldHelper(
+  /// \brief Generate IR for getting a helper for a field and calling it.
+  ///
+  /// \param ResolvedToken     Resolved token.
+  /// \param HelperId          Helper ID.
+  /// \param IsLoad            True iff the call is for a load.
+  /// \param Dst               Destination \p IRNode.
+  /// \param Obj               Object \p IRNode.
+  /// \param Value             Value \p IRNode.
+  /// \param Alignment         Alignment.
+  /// \param IsVolatile        True iff it is volatile.
+  ///
+  /// \returns An \p IRNode that represents the target of the call helper, or
+  //           the destination if the field is a struct.
+  IRNode *rdrCallFieldHelper(
       CORINFO_RESOLVED_TOKEN *ResolvedToken, CorInfoHelpFunc HelperId,
       bool IsLoad,
       IRNode *Dst, // dst node if this is a load, otherwise nullptr
@@ -2295,6 +2339,9 @@ public:
   IRNode *rdrCallGetStaticBase(CORINFO_CLASS_HANDLE Class, mdToken ClassToken,
                                CorInfoHelpFunc HelperId, bool NoCtor,
                                bool CanMoveUp, IRNode *Dst);
+
+  IRNode *rdrMakeLdFtnTargetNode(CORINFO_RESOLVED_TOKEN *ResolvedToken,
+                                 CORINFO_CALL_INFO *CallInfo);
 
 public:
   // //////////////////////////////////////////////////////////////////////////
@@ -2458,6 +2505,11 @@ public:
   void setMethodAttribs(CORINFO_METHOD_HANDLE Handle,
                         CorInfoMethodRuntimeFlags Flag);
 
+  virtual std::string appendClassNameAsString(CORINFO_CLASS_HANDLE Class,
+                                              bool IncludeNamespace,
+                                              bool FullInst,
+                                              bool IncludeAssembly) = 0;
+
   bool checkMethodModifier(CORINFO_METHOD_HANDLE Method, LPCSTR Modifier,
                            bool IsOptional);
   mdToken getMethodDefFromMethod(CORINFO_METHOD_HANDLE Handle);
@@ -2572,8 +2624,7 @@ public:
   virtual IRNode *call(ReaderBaseNS::CallOpcode Opcode, mdToken Token,
                        mdToken ConstraintTypeRef, mdToken LoadFtnToken,
                        bool IsReadOnlyPrefix, bool IsTailCallPrefix,
-                       bool IsUnmarkedTailCall, uint32_t CurrentOffset,
-                       bool *IsRecursiveTailCall) = 0;
+                       bool IsUnmarkedTailCall, uint32_t CurrentOffset) = 0;
   virtual IRNode *castClass(CORINFO_RESOLVED_TOKEN *ResolvedToken,
                             IRNode *ObjRefNode);
   virtual IRNode *isInst(CORINFO_RESOLVED_TOKEN *ResolvedToken,
@@ -2595,12 +2646,43 @@ public:
   virtual void dup(IRNode *Opr, IRNode **Result1, IRNode **Result2) = 0;
   virtual void endFilter(IRNode *Arg1) = 0;
 
+  /// \brief Obtain an iterator for the successor edges of a FlowGraphNode
+  ///
+  /// \param FgNode   The FlowGraphNode of interest.
+  /// \returns        An iterator for the successor edges.
+  virtual FlowGraphEdgeIterator fgNodeGetSuccessors(FlowGraphNode *FgNode) = 0;
+
+  /// \brief Obtain an iterator for the predecessor edges of a FlowGraphNode
+  ///
+  /// \param FgNode   The FlowGraphNode of interest.
+  /// \returns        An itetrator for the predecessor edges.
+  virtual FlowGraphEdgeIterator
+  fgNodeGetPredecessors(FlowGraphNode *FgNode) = 0;
+
+  /// \brief Obtain an iterator for the actual (non-exceptional) successor edges
+  /// of a FlowGraphNode
+  ///
+  /// \param FgNode   The FlowGraphNode of interest.
+  /// \returns        An iterator for the actual successor edges.
+  FlowGraphEdgeIterator fgNodeGetSuccessorsActual(FlowGraphNode *Fg);
+
+  /// \brief Obtain an iterator for the actual (non-exceptional) predecessor
+  /// edges of a FlowGraphNode
+  ///
+  /// \param FgNode   The FlowGraphNode of interest.
+  /// \returns        An iterator for the actual predecessor edges.
+  FlowGraphEdgeIterator fgNodeGetPredecessorsActual(FlowGraphNode *Fg);
+
   virtual FlowGraphNode *fgNodeGetNext(FlowGraphNode *FgNode) = 0;
   virtual uint32_t fgNodeGetStartMSILOffset(FlowGraphNode *Fg) = 0;
   virtual void fgNodeSetStartMSILOffset(FlowGraphNode *Fg, uint32_t Offset) = 0;
   virtual uint32_t fgNodeGetEndMSILOffset(FlowGraphNode *Fg) = 0;
   virtual void fgNodeSetEndMSILOffset(FlowGraphNode *FgNode,
                                       uint32_t Offset) = 0;
+  virtual EHRegion *fgNodeGetRegion(FlowGraphNode *FgNode) = 0;
+  virtual void fgNodeSetRegion(FlowGraphNode *FgNode, EHRegion *EhRegion) = 0;
+  virtual void fgNodeChangeRegion(FlowGraphNode *FgNode,
+                                  EHRegion *EhRegion) = 0;
 
   /// \brief Checks whether this node has been visited by an algorithm
   /// traversing the flow graph.
@@ -2633,6 +2715,13 @@ public:
   /// propagate operand stack.
   bool fgNodeHasMultiplePredsPropagatingStack(FlowGraphNode *Node);
 
+  /// Check whether this node has any predecessors that propagate operand stack.
+  ///
+  /// \param Node Flow graph node.
+  /// \returns true iff this flow graph node has any predecessors that propagate
+  /// operand stack.
+  bool fgNodeHasNoPredsPropagatingStack(FlowGraphNode *Node);
+
   virtual IRNode *
   getStaticFieldAddress(CORINFO_RESOLVED_TOKEN *ResolvedToken) = 0;
   virtual void initBlk(IRNode *NumBytes, IRNode *ValuePerByte,
@@ -2640,14 +2729,12 @@ public:
                        bool IsVolatile);
   virtual void initObj(CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *Arg2);
   virtual void insertThrow(CorInfoHelpFunc ThrowHelper, uint32_t Offset);
-  virtual void jmp(ReaderBaseNS::CallOpcode Opcode, mdToken Token, bool HasThis,
-                   bool HasVarArg) = 0;
+  virtual void jmp(ReaderBaseNS::CallOpcode Opcode, mdToken Token) = 0;
 
   virtual uint32_t updateLeaveOffset(uint32_t LeaveOffset, uint32_t NextOffset,
                                      FlowGraphNode *LeaveBlock,
                                      uint32_t TargetOffset) = 0;
-  virtual void leave(uint32_t TargetOffset, bool IsNonLocal,
-                     bool EndsWithNonLocalGoto) = 0;
+  virtual void leave(uint32_t TargetOffset) = 0;
   virtual IRNode *loadArg(uint32_t ArgOrdinal, bool IsJmp) = 0;
   virtual IRNode *loadLocal(uint32_t ArgOrdinal) = 0;
   virtual IRNode *loadArgAddress(uint32_t ArgOrdinal) = 0;
@@ -2713,7 +2800,7 @@ public:
   /// \param Class  Class handle that corresponds to RuntimeTypeHandle,
   ///               RuntimeMethodHandle, or RuntimeFieldHandle.
   ///
-  /// \returns Runtime handle corresponding to the token node..
+  /// \returns Runtime handle corresponding to the token node.
   virtual IRNode *convertHandle(IRNode *RuntimeTokenNode,
                                 CorInfoHelpFunc HelperID,
                                 CORINFO_CLASS_HANDLE Class) = 0;
@@ -2727,6 +2814,9 @@ public:
   virtual IRNode *loadVirtFunc(IRNode *Arg1,
                                CORINFO_RESOLVED_TOKEN *ResolvedToken,
                                CORINFO_CALL_INFO *CallInfo) = 0;
+  virtual IRNode *
+  getReadyToRunVirtFuncPtr(IRNode *Arg1, CORINFO_RESOLVED_TOKEN *ResolvedToken,
+                           CORINFO_CALL_INFO *CallInfo) = 0;
   virtual IRNode *loadPrimitiveType(IRNode *Address, CorInfoType CorType,
                                     ReaderAlignType Alignment, bool IsVolatile,
                                     bool IsInterfConst,
@@ -2737,6 +2827,16 @@ public:
     return loadPrimitiveType(Address, CorType, Alignment, IsVolatile,
                              IsInterfConst, false);
   }
+
+  /// \brief Load a non-primitive object (i.e., a struct).
+  ///
+  /// \param Address Address of the struct.
+  /// \param Class Class handle corresponding to the struct.
+  /// \param Alignment Alignment of the load.
+  /// \param IsVolatile true iff this is a volatile load.
+  /// \param AddressMayBeNull true iff Address may be null.
+  ///
+  /// \returns Node representing loaded struct.
   virtual IRNode *loadNonPrimitiveObj(IRNode *Address,
                                       CORINFO_CLASS_HANDLE Class,
                                       ReaderAlignType Alignment,
@@ -2758,7 +2858,7 @@ public:
   virtual IRNode *refAnyType(IRNode *Arg1) = 0;
   virtual IRNode *refAnyVal(IRNode *Val, CORINFO_RESOLVED_TOKEN *ResolvedToken);
   virtual void rethrow() = 0;
-  virtual void returnOpcode(IRNode *Opr, bool IsSynchronousMethod) = 0;
+  virtual void returnOpcode(IRNode *Opr, bool IsSynchronizedMethod) = 0;
   virtual IRNode *shift(ReaderBaseNS::ShiftOpcode Opcode, IRNode *ShiftAmount,
                         IRNode *ShiftOperand) = 0;
   virtual IRNode *sizeofOpcode(CORINFO_RESOLVED_TOKEN *ResolvedToken) = 0;
@@ -2784,13 +2884,17 @@ public:
   virtual void storePrimitiveType(IRNode *Value, IRNode *Address,
                                   CorInfoType CorType,
                                   ReaderAlignType Alignment, bool IsVolatile,
-
                                   bool AddressMayBeNull = true) = 0;
   void storePrimitiveTypeNonNull(IRNode *Value, IRNode *Address,
                                  CorInfoType CorType, ReaderAlignType Alignment,
                                  bool IsVolatile) {
     storePrimitiveType(Value, Address, CorType, Alignment, IsVolatile, false);
   }
+  virtual void storeNonPrimitiveType(IRNode *Value, IRNode *Addr,
+                                     CORINFO_CLASS_HANDLE Class,
+                                     ReaderAlignType Alignment, bool IsVolatile,
+                                     CORINFO_RESOLVED_TOKEN *ResolvedToken,
+                                     bool IsField) = 0;
   virtual void storeLocal(uint32_t LocOrdinal, IRNode *Arg1,
                           ReaderAlignType Alignment, bool IsVolatile) = 0;
   virtual void storeObj(CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *Value,
@@ -2806,14 +2910,29 @@ public:
   virtual void storeStaticField(CORINFO_RESOLVED_TOKEN *FieldToken,
                                 IRNode *ValueToStore, bool IsVolatile) = 0;
   virtual IRNode *stringGetChar(IRNode *Arg1, IRNode *Arg2) = 0;
-  virtual bool sqrt(IRNode *Arg1, IRNode **RetVal) = 0;
+
+  /// Optionally generate inline code for the \p sqrt operation
+  ///
+  /// \param Argument      input value for sqrt
+  /// \param Result [out]  resulting sqrt value, iff reader decided to expand
+  /// \returns             true iff Result represents the sqrt
+  virtual bool sqrt(IRNode *Argument, IRNode **Result) = 0;
 
   virtual bool interlockedIntrinsicBinOp(IRNode *Arg1, IRNode *Arg2,
                                          IRNode **RetVal,
                                          CorInfoIntrinsics IntrinsicID) = 0;
-  virtual bool interlockedCmpXchg(IRNode *Arg1, IRNode *Arg2, IRNode *Arg3,
-                                  IRNode **RetVal,
+
+  /// Generate inline code for the \p interlockedCmpXchg operation
+  ///
+  /// \param Destination    A pointer to the destination
+  /// \param Exchange       The exchange value
+  /// \param Comparand      The value to compare to the destination
+  /// \param Result [out]   The result is the initial destination
+  /// \returns              true iff the client expanded the interlockedCmpXchg
+  virtual bool interlockedCmpXchg(IRNode *Destination, IRNode *Exchange,
+                                  IRNode *Comparand, IRNode **Result,
                                   CorInfoIntrinsics IntrinsicID) = 0;
+
   virtual bool memoryBarrier() = 0;
   virtual void switchOpcode(IRNode *Opr) = 0;
   virtual void throwOpcode(IRNode *Arg1) = 0;
@@ -2845,13 +2964,16 @@ public:
   methodNeedsToKeepAliveGenericsContext(bool KeepGenericsCtxtAlive) = 0;
 
   // Called to instantiate an empty reader stack.
-  virtual ReaderStack *createStack(uint32_t MaxStack, ReaderBase *Reader) = 0;
+  virtual ReaderStack *createStack() = 0;
 
   // Called when reader begins processing method.
   virtual void readerPrePass(uint8_t *Buffer, uint32_t NumBytes) = 0;
 
   // Called between building the flow graph and inserting the IR
   virtual void readerMiddlePass(void) = 0;
+
+  // Called after reading all MSIL, before removing unreachable blocks
+  virtual void readerPostVisit() = 0;
 
   // Called when reader has finished processing method.
   virtual void readerPostPass(bool IsImportOnly) = 0;
@@ -2876,10 +2998,6 @@ public:
   // Remove all IRNodes from block (for verification error processing.)
   virtual void clearCurrentBlock() = 0;
 
-  // Called when an assert occurs (debug only)
-  static void debugError(const char *Filename, uint32_t LineNumber,
-                         const char *Message);
-
   // Notify client of alignment problem
   virtual void verifyStaticAlignment(void *Pointer, CorInfoType CorType,
                                      uint32_t MinClassAlign) = 0;
@@ -2900,6 +3018,7 @@ public:
 
   virtual EHRegion *rgnAllocateRegion() = 0;
   virtual EHRegionList *rgnAllocateRegionList() = 0;
+  virtual void setDebugLocation(uint32_t CurrOffset, bool IsCall) = 0;
 
   //
   // REQUIRED Flow and Region Graph Manipulation Routines
@@ -2914,40 +3033,41 @@ public:
 
   virtual BranchList *fgGetLabelBranchList(IRNode *LabelNode) = 0;
 
-  virtual void insertHandlerAnnotation(EHRegion *HandlerRegion) = 0;
-  virtual void insertRegionAnnotation(IRNode *RegionStartNode,
-                                      IRNode *RegionEndNode) = 0;
   virtual void fgAddLabelToBranchList(IRNode *LabelNode,
                                       IRNode *BranchNode) = 0;
   virtual void fgAddArc(IRNode *BranchNode, FlowGraphNode *Source,
                         FlowGraphNode *Sink) = 0;
   virtual bool fgBlockHasFallThrough(FlowGraphNode *Block) = 0;
   virtual void fgDeleteBlock(FlowGraphNode *Block) = 0;
-  virtual void fgDeleteEdge(FlowGraphEdgeList *Arc) = 0;
+  virtual void fgDeleteEdge(FlowGraphEdgeIterator &Iterator) = 0;
   virtual void fgDeleteNodesFromBlock(FlowGraphNode *Block) = 0;
   virtual IRNode *fgNodeGetEndInsertIRNode(FlowGraphNode *FgNode) = 0;
-
-  // Returns true iff client considers the JMP recursive and wants a
-  // loop back-edge rather than a forward edge to the exit label.
-  virtual bool fgOptRecurse(mdToken Token) = 0;
-
-  // Returns true iff client considers the CALL/JMP recursive and wants a
-  // loop back-edge rather than a forward edge to the exit label.
-  virtual bool fgOptRecurse(ReaderCallTargetData *CallTargetData) = 0;
-
-  // Returns true if node (the start of a new eh region) cannot be the start of
-  // a block.
-  virtual bool fgEHRegionStartRequiresBlockSplit(IRNode *Node) = 0;
-
-  virtual bool fgIsExceptRegionStartNode(IRNode *Node) = 0;
   virtual FlowGraphNode *fgSplitBlock(FlowGraphNode *Block, IRNode *Node) = 0;
-  virtual void fgSetBlockToRegion(FlowGraphNode *Block, EHRegion *Region,
-                                  uint32_t LastOffset) = 0;
   virtual IRNode *fgMakeBranch(IRNode *LabelNode, IRNode *BlockNode,
                                uint32_t CurrentOffset, bool IsConditional,
                                bool IsNominal) = 0;
+  /// \brief Create IR for an endfinally instruction.
+  ///
+  /// Have the client create IR for an endfinally instruction. Note
+  /// there can be more than one of these in a finally region.
+  ///
+  /// \param BlockNode     the block that is the end of the finally.
+  /// \param FinallyRegion the finally region being ended.
+  /// \param Offset        msil offset for the endfinally instruction.
+  /// \returns the branch generated to terminate the block for this endfinally.
   virtual IRNode *fgMakeEndFinally(IRNode *BlockNode, EHRegion *FinallyRegion,
                                    uint32_t CurrentOffset) = 0;
+  /// \brief Create IR for an endfault instruction.
+  ///
+  /// Have the client create IR for an endfault instruction. Note
+  /// there can be more than one of these in a fault region.
+  ///
+  /// \param BlockNode     the block that is the end of the fault.
+  /// \param FaultRegion   the fault region being ended.
+  /// \param Offset        msil offset for the endfault instruction.
+  /// \returns the branch generated to terminate the block for this endfault.
+  virtual IRNode *fgMakeEndFault(IRNode *BlockNode, EHRegion *FaultRegion,
+                                 uint32_t CurrentOffset) = 0;
 
   // turns an unconditional branch to the entry label into a fall-through
   // or a branch to the exit label, depending on whether it was a recursive
@@ -2956,25 +3076,18 @@ public:
 
   virtual IRNode *fgMakeSwitch(IRNode *DefaultLabel, IRNode *Node) = 0;
   virtual IRNode *fgMakeThrow(IRNode *Node) = 0;
+  virtual IRNode *fgMakeReturn(IRNode *Node) = 0;
   virtual IRNode *fgAddCaseToCaseList(IRNode *SwitchNode, IRNode *LabelNode,
                                       uint32_t Element) = 0;
-  virtual void insertEHAnnotationNode(IRNode *InsertionPointNode,
-                                      IRNode *Node) = 0;
+  /// Construct a new FlowGraphNode
+  ///
+  /// \param TargetOffset  The start MSIL offset for the new node
+  /// \param PreviousNode  The new node will follow \p PreviousNode in the
+  ///                      node list if specified (may be nullptr, in which case
+  ///                      the new node will simply be appended)
+  /// \returns The new FlowGraphNode
   virtual FlowGraphNode *makeFlowGraphNode(uint32_t TargetOffset,
-                                           EHRegion *Region) = 0;
-  virtual void markAsEHLabel(IRNode *LabelNode) = 0;
-  virtual IRNode *makeTryEndNode(void) = 0;
-  virtual IRNode *makeRegionStartNode(ReaderBaseNS::RegionKind RegionType) = 0;
-  virtual IRNode *makeRegionEndNode(ReaderBaseNS::RegionKind RegionType) = 0;
-  virtual void fgCleanupTryEnd(EHRegion *Region){};
-
-  // Hook to permit client to record call information returns true if the call
-  // is a recursive tail
-  // call and thus should be turned into a loop
-  virtual bool fgCall(ReaderBaseNS::OPCODE Opcode, mdToken Token,
-                      mdToken ConstraintToken, uint32_t ILOffset, IRNode *Block,
-                      bool CanInline, bool IsTailCall, bool IsUnmarkedTailCall,
-                      bool IsReadOnly) = 0;
+                                           FlowGraphNode *PreviousNode) = 0;
 
   // Replace all uses of oldNode in the IR with newNode and delete oldNode.
   virtual void replaceFlowGraphNodeUses(FlowGraphNode *OldNode,
@@ -2983,28 +3096,15 @@ public:
   virtual IRNode *exitLabel(void) = 0;
   virtual IRNode *entryLabel(void) = 0;
 
-  // Function is passed a try region, and is expected to return the first label
-  // or instruction
-  // after the region.
-  virtual IRNode *findTryRegionEndOfClauses(EHRegion *TryRegion) = 0;
-
   virtual bool isCall() = 0;
   virtual bool isRegionStartBlock(FlowGraphNode *Fg) = 0;
-  virtual bool isRegionEndBlock(FlowGraphNode *Fg) = 0;
-
-  // Create a symbol node that will be used to represent the stack-incoming
-  // exception object
-  // upon entry to funclets.
-  virtual IRNode *makeExceptionObject() = 0;
 
   // //////////////////////////////////////////////////////////////////////////
   // Client Supplied Helper Routines, required by VOS support
   // //////////////////////////////////////////////////////////////////////////
 
   // Asks GenIR to make operand value accessible by address, and return a node
-  // that references
-  // the incoming operand by address.
-  virtual IRNode *addressOfLeaf(IRNode *Leaf) = 0;
+  // that references the incoming operand by address.
   virtual IRNode *addressOfValue(IRNode *Leaf) = 0;
 
   /// \brief Delegate to GenIR to generate code to instantiate a new MDArray.
@@ -3046,18 +3146,86 @@ public:
                                       IRNode *ThisArg) = 0;
 
   // Helper callback used by rdrCall to emit call code.
-  virtual IRNode *genCall(ReaderCallTargetData *CallTargetData,
+  virtual IRNode *genCall(ReaderCallTargetData *CallTargetData, bool MayThrow,
                           std::vector<IRNode *> Args, IRNode **CallNode) = 0;
 
   virtual bool canMakeDirectCall(ReaderCallTargetData *CallTargetData) = 0;
 
-  // Generate call to helper
-  virtual IRNode *callHelper(CorInfoHelpFunc HelperID, IRNode *Dst,
-                             IRNode *Arg1 = nullptr, IRNode *Arg2 = nullptr,
-                             IRNode *Arg3 = nullptr, IRNode *Arg4 = nullptr,
+  /// \brief Generate call to a helper.
+  ///
+  /// \param HelperID        Helper ID.
+  /// \param MayThrow        True iff this helper may throw.
+  /// \param Dst             Destination node.
+  /// \param Arg1            First helper argument.
+  /// \param Arg2            Second helper argument.
+  /// \param Arg3            Third helper argument.
+  /// \param Arg4            Fourth helper argument.
+  /// \param Alignment       Memory alignment for helpers that care about it.
+  /// \param IsVolatile      True iff the operation performed by the helper is
+  ///                        volatile.
+  /// \param NoCtor          True if the operation definitely will NOT invoke
+  ///                        the static constructor.
+  /// \param CanMoveUp       True iff the call may be moved up out of loops.
+  ///
+  /// \returns An \p IRNode that represents the result of the helper call.
+  virtual IRNode *callHelper(CorInfoHelpFunc HelperID, bool MayThrow,
+                             IRNode *Dst, IRNode *Arg1 = nullptr,
+                             IRNode *Arg2 = nullptr, IRNode *Arg3 = nullptr,
+                             IRNode *Arg4 = nullptr,
                              ReaderAlignType Alignment = Reader_AlignUnknown,
                              bool IsVolatile = false, bool NoCtor = false,
                              bool CanMoveUp = false) = 0;
+
+  /// \brief Generate call to a helper.
+  ///
+  /// \param HelperID        Helper ID.
+  /// \param HelperAddress   Address of the helper.
+  /// \param MayThrow        True iff this helper may throw.
+  /// \param Dst             Destination node.
+  /// \param Arg1            First helper argument.
+  /// \param Arg2            Second helper argument.
+  /// \param Arg3            Third helper argument.
+  /// \param Arg4            Fourth helper argument.
+  /// \param Alignment       Memory alignment for helpers that care about it.
+  /// \param IsVolatile      True iff the operation performed by the helper is
+  ///                        volatile.
+  /// \param NoCtor          True if the operation definitely will NOT invoke
+  ///                        the static constructor.
+  /// \param CanMoveUp       True iff the call may be moved up out of loops.
+  ///
+  /// \returns An \p IRNode that represents the result of the helper call.
+  virtual IRNode *callHelper(CorInfoHelpFunc HelperID, IRNode *HelperAddress,
+                             bool MayThrow, IRNode *Dst, IRNode *Arg1 = nullptr,
+                             IRNode *Arg2 = nullptr, IRNode *Arg3 = nullptr,
+                             IRNode *Arg4 = nullptr,
+                             ReaderAlignType Alignment = Reader_AlignUnknown,
+                             bool IsVolatile = false, bool NoCtor = false,
+                             bool CanMoveUp = false) = 0;
+
+  /// \brief Generate call to a ReadyToRun helper.
+  ///
+  /// \param HelperID        Helper ID.
+  /// \param MayThrow        True iff this helper may throw.
+  /// \param Dst             Destination node.
+  /// \param ResolvedToken   Token corresponding to the helper.
+  /// \param Arg1            First helper argument.
+  /// \param Arg2            Second helper argument.
+  /// \param Arg3            Third helper argument.
+  /// \param Arg4            Fourth helper argument.
+  /// \param Alignment       Memory alignment for helpers that care about it.
+  /// \param IsVolatile      True iff the operation performed by the helper is
+  ///                        volatile.
+  /// \param NoCtor          True if the operation definitely will NOT invoke
+  ///                        the static constructor.
+  /// \param CanMoveUp       True iff the call may be moved up out of loops.
+  ///
+  /// \returns An \p IRNode that represents the result of the helper call.
+  virtual IRNode *callReadyToRunHelper(
+      CorInfoHelpFunc HelperID, bool MayThrow, IRNode *Dst,
+      CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *Arg1 = nullptr,
+      IRNode *Arg2 = nullptr, IRNode *Arg3 = nullptr, IRNode *Arg4 = nullptr,
+      ReaderAlignType Alignment = Reader_AlignUnknown, bool IsVolatile = false,
+      bool NoCtor = false, bool CanMoveUp = false) = 0;
 
   // Generate special generics helper that might need to insert flow
   virtual IRNode *callRuntimeHandleHelper(CorInfoHelpFunc Helper, IRNode *Arg1,
@@ -3066,11 +3234,11 @@ public:
 
   /// Converts the operand to an argument type understood by the boxing helper
   ///
-  /// \param Opr Operand
-  /// \param CorType CorInfoType of the operand.
-  /// \returns Converted operand
+  /// \param Opr      Operand to pass to the boxing helper.
+  /// \param DestSize Size of the box type in bytes.
+  /// \returns        Converted operand
   virtual IRNode *convertToBoxHelperArgumentType(IRNode *Opr,
-                                                 CorInfoType CorType) = 0;
+                                                 uint32_t DestSize) = 0;
 
   virtual IRNode *genNullCheck(IRNode *Node) = 0;
 
@@ -3094,6 +3262,18 @@ public:
                                      CORINFO_RESOLVED_TOKEN *ResolvedToken,
                                      CORINFO_FIELD_INFO *FieldInfo) = 0;
 
+  /// \brief Convert handle into an \p IRNode.
+  ///
+  /// \param Token           Token corresponding to the handle.
+  /// \param EmbedHandle     Handle to convert.
+  /// \param RealHandle      Optional compile-time handle.
+  /// \param IsIndirect      True iff the handle represents an indirection.
+  /// \param IsReadonly      True iff the handle represent a read-only value.
+  /// \param IsRelocatable   True iff the handle is relocatable.
+  /// \param IsCallTarget    True iff the handle represents a call target.
+  /// \param IsFrozenObject  True iff the handle represents a frozen object.
+  ///
+  /// \returns An \p IRNode corresponding to the handle.
   virtual IRNode *handleToIRNode(mdToken Token, void *EmbedHandle,
                                  void *RealHandle, bool IsIndirect,
                                  bool IsReadOnly, bool IsRelocatable,
@@ -3102,15 +3282,38 @@ public:
 
   /// Create an operand that will be used to pass to the boxing helper
   ///
-  /// \param Class CORINFO_CLASS_HANDLE of the type to be boxed
+  /// \param Class \p CORINFO_CLASS_HANDLE for the type to be boxed
   /// \returns Operand
   virtual IRNode *makeBoxDstOperand(CORINFO_CLASS_HANDLE Class) = 0;
+
+  /// Create an operand that will be used to determine the return type
+  /// of the refanytype helper.
+  ///
+  /// \param Class  \p CORINFO_CLASS_HANDLE for the type being extracted
+  ///               from the \p TypedReference.
+  /// \returns The appropriately-typed operand.
+  virtual IRNode *makeRefAnyDstOperand(CORINFO_CLASS_HANDLE Class) = 0;
 
   virtual IRNode *makePtrDstGCOperand(bool IsInteriorGC) = 0;
   virtual IRNode *makePtrNode(ReaderPtrType PointerType = Reader_PtrNotGc) = 0;
   virtual IRNode *makeStackTypeNode(IRNode *Node) = 0;
 
-  virtual IRNode *makeDirectCallTargetNode(void *CodeAddress) = 0;
+  /// Create a direct call target node.
+  ///
+  /// \param MethodHandle  Handle of the method to call.
+  /// \param MethodToken  Token of the method to call.
+  /// \param CodeAddress  Method address.
+  /// \returns Call target node for the given method and code address.
+  virtual IRNode *makeDirectCallTargetNode(CORINFO_METHOD_HANDLE MethodHandle,
+                                           mdToken MethodToken,
+                                           void *CodeAddress) = 0;
+
+  /// \brief Infer the type of the 'this' argument to an indirect call from
+  ///        the given IR node.
+  ///
+  /// \param ThisArgument  The IR node that represents the 'this' argument.
+  /// \returns The class handle that corresponds to the type of the node.
+  virtual CORINFO_CLASS_HANDLE inferThisClass(IRNode *ThisArgument) = 0;
 
   // Called once region tree has been built.
   virtual void setEHInfo(EHRegion *EhRegionTree,
@@ -3135,6 +3338,18 @@ public:
   virtual bool arrayGet(CORINFO_SIG_INFO *Sig, IRNode **RetVal) = 0;
   virtual bool arraySet(CORINFO_SIG_INFO *Sig) = 0;
 
+  /// \brief Copy struct pointed to by Src to Dst address. The struct may have
+  //  GC pointers so copying may involve write barriers.
+  ///
+  /// \param Class Struct's class handle.
+  /// \param Dst Destination address.
+  /// \param Src Source address.
+  /// \param Alignment.
+  /// \returns The class handle that corresponds to the type of the node.
+  virtual void copyStruct(CORINFO_CLASS_HANDLE Class, IRNode *Dst, IRNode *Src,
+                          ReaderAlignType Alignment, bool IsVolatile,
+                          bool IsUnchecked) = 0;
+
 #if !defined(NDEBUG)
   virtual void dbDumpFunction(void) = 0;
   virtual void dbPrintIRNode(IRNode *Instr) = 0;
@@ -3144,6 +3359,141 @@ public:
 #endif
 
   static bool rdrIsMethodVirtual(uint32_t MethodAttribs);
+
+  /// \brief Return Method name for non helper and non native Methods.
+  ///
+  /// \param method  Method handle for the target Method.
+  /// \param classNamePtr out param, Module name.
+  /// \param JitInfo The JIT interface for this method
+  /// \returns Method name.
+  const char *getMethodName(CORINFO_METHOD_HANDLE Method,
+                            const char **ClassNamePtr, ICorJitInfo *JitInfo);
+
+  /// \brief Return true if we process this Class with SIMD intrinsics.
+  ///
+  /// \param Class The class handle for the call target method's class.
+  /// \returns  result, that represents true if HW acceleration
+  /// enabled for this class, false otherwise.
+  virtual IRNode *generateIsHardwareAccelerated(CORINFO_CLASS_HANDLE Class) = 0;
+
+  /// \brief Return result of binary or unary operation on SIMD Vector Types.
+  /// \brief It gets arguments from stack.
+  ///
+  /// \param OperationCode code to be done.
+  /// \returns an IRNode representing the result of the intrinsic
+  /// or nullptr if the intrinsic is not supported.
+
+  IRNode *generateSIMDBinOp(ReaderSIMDIntrinsic OperationCode,
+                            CORINFO_CLASS_HANDLE Class);
+  IRNode *generateSIMDUnOp(ReaderSIMDIntrinsic OperationCode);
+
+  /// \brief Return IRNode* Result of BinOp.
+  ///
+  /// \param Vector1 the first argument for BinOp.
+  /// \param Vector2 the second argument for BinOp.
+  /// \returns an IRNode representing the result of BinOp
+  /// or nullptr if BinOp is not supported.
+
+  virtual IRNode *vectorAdd(IRNode *Vector1, IRNode *Vector2) = 0;
+  virtual IRNode *vectorSub(IRNode *Vector1, IRNode *Vector2) = 0;
+  virtual IRNode *vectorMul(IRNode *Vector1, IRNode *Vector2) = 0;
+  virtual IRNode *vectorDiv(IRNode *Vector1, IRNode *Vector2,
+                            bool IsSigned) = 0;
+  virtual IRNode *vectorMax(IRNode *Vector1, IRNode *Vector2,
+                            bool IsSigned) = 0;
+  virtual IRNode *vectorMin(IRNode *Vector1, IRNode *Vector2,
+                            bool IsSigned) = 0;
+  virtual IRNode *vectorBitOr(IRNode *Vector1, IRNode *Vector2,
+                              unsigned VectorByteSize) = 0;
+  virtual IRNode *vectorBitAnd(IRNode *Vector1, IRNode *Vector2,
+                               unsigned VectorByteSize) = 0;
+  virtual IRNode *vectorBitExOr(IRNode *Vector1, IRNode *Vector2,
+                                unsigned VectorByteSize) = 0;
+
+  virtual IRNode *vectorEqual(IRNode *Vector1, IRNode *Vector2) = 0;
+  virtual IRNode *vectorNotEqual(IRNode *Vector1, IRNode *Vector2) = 0;
+
+  /// \brief Return IRNode* Result of UnOp.
+  ///
+  /// \param Vector  argument for UnOp.
+  /// \returns an IRNode representing the result of UnOp
+  /// or nullptr if UnOp is not supported.
+  virtual IRNode *vectorAbs(IRNode *Vector) = 0;
+  virtual IRNode *vectorSqrt(IRNode *Vector) = 0;
+
+  /// \brief Return result of ctor operation on SIMD Vector Types.
+  ///
+  /// \param ArgsCount Number of arguments on stack for call.
+  /// \param Class The class handle for the call target method's class.
+  /// \param Opcode Operation Opcode to distinguish newobj from ctor.
+  /// \returns an IRNode representing the result of ctor
+  /// or nullptr if ctor is not supported.
+  IRNode *generateSIMDCtor(CORINFO_CLASS_HANDLE Class, int ArgsCount,
+                           ReaderBaseNS::CallOpcode Opcode);
+
+  /// \brief Return IRNode* Result of ctor.
+  ///
+  /// \param Class The class handle for the call target method's class.
+  /// \param This in not null for ctor, null for newobj.
+  /// \param Args, args for ctor.
+  /// \returns an IRNode representing the result of ctor
+  /// or nullptr if ctor is not supported.
+  virtual IRNode *vectorCtor(CORINFO_CLASS_HANDLE Class, IRNode *This,
+                             std::vector<IRNode *> Args) = 0;
+
+  /// \brief Return length of Generic Vector.
+  ///
+  /// \param Class The class handle for the call target method's class.
+  /// \returns an IRNode representing the length of Class
+  /// or nullptr if getCount or Class is not supported.
+  virtual IRNode *vectorGetCount(CORINFO_CLASS_HANDLE Class) = 0;
+
+  /// \brief Return result of get_Item operation on SIMD Vector Types.
+  ///
+  /// \returns an IRNode representing the result of get_Item.
+  IRNode *generateSIMDGetItem(CorInfoType ResType);
+
+  /// \brief Return IRNode* Result of get item from vector.
+  ///
+  /// \param VectorPointer is address of vector.
+  /// \param Index of dst element.
+  /// \returns an IRNode representing the result element.
+  virtual IRNode *vectorGetItem(IRNode *VectorPointer, IRNode *Index,
+                                CorInfoType ResType) = 0;
+
+  /// \brief Return IRNode* The result of the intrinsic or nullptr, if it is
+  /// unnsupported.
+  ///
+  /// \param Class The class handle for the call target method's class.
+  /// \param  Method handle for the target Method.
+  /// \param  SigInfo info for the target Method.
+  /// \returns an IRNode representing the result of the intrinsic
+  /// \or nullptr if the intrinsic is not supported.
+  IRNode *generateSIMDIntrinsicCall(CORINFO_CLASS_HANDLE Class,
+                                    CORINFO_METHOD_HANDLE Method,
+                                    CORINFO_SIG_INFO *SigInfo,
+                                    ReaderBaseNS::CallOpcode Opcode);
+
+  /// \brief Check LLVM::VectorType.
+  ///
+  /// \param Arg The target for checking.
+  /// \returns true if Arg is supported vector type.
+  virtual bool isVectorType(IRNode *Arg) = 0;
+
+  /// \brief Return length of Vector or 0 if it is not Vector.
+  ///
+  /// \param Class The class handle for the call target method's class.
+  /// \returns number of elements in vector.
+  virtual int getElementCountOfSIMDType(CORINFO_CLASS_HANDLE Class) = 0;
+
+  /// \brief Return is vector element signed or not.
+  ///
+  /// \param Class The class handle for the call target method's class.
+  /// \returns true if signed.
+  virtual bool getIsSigned(CORINFO_CLASS_HANDLE Class) = 0;
+
+  virtual unsigned
+  getMaxIntrinsicSIMDVectorLength(CORINFO_CLASS_HANDLE Class) = 0;
 
 private:
   ///////////////////////////////////////////////////////////////////////

@@ -1,6 +1,6 @@
-#LLILC Architecture Overview
+# LLILC Architecture Overview
 
-##Introduction
+## Introduction
 
 LLILC is a code generator based on LLVM for MSIL (C#).  The intent of the architecture is to allow 
 compilation of MSIL using industrial strength components from a C++ compiler.  LLVM gives us the 
@@ -24,7 +24,7 @@ The following are the main components of the system.  In the case of CoreCLR and
 are provided by other projects/repositories and provide their own documentation.  Others, like the MSIL 
 reader, are provided by LLILC.
 
-####CoreCLR
+#### CoreCLR
 
 The CoreCLR is the open source dynamic execution environment for MSIL (C#). It provides a dynamic type system, 
 a code manager that organizes compilation, and an execution engine (EE).  Additionally the runtime provides the 
@@ -43,35 +43,31 @@ for the JIT compilation model, and within the native runtime for the AOT model. 
 on the heap are used to identify fields with GC references, and the JIT is required to report stack slots and registers that 
 contain GC references.  This information is used by the garbage collector for updating references when heap objects 
 are relocated.  A discussion of the garbage collector as used by LLILC is 
-[here](https://github.com/dotnet/llilc/blob/master/Documentation/llilc-gc.md).
+[here](llilc-gc.md).
 
-####MSIL reader
+#### MSIL reader
 
 The key component needed to start testing code generation out of LLVM and get basic methods working 
 is an MSIL reader.  This component takes a request from [CoreCLR](https://github.com/dotnet/coreclr) to 
 compile a method, reads in all the method MSIL, maps the required types into LLVM, and translates the MSIL 
-opcodes into BitCode. The base Reader code is [here](https://github.com/dotnet/llilc/blob/master/lib/Reader/reader.cpp) 
+opcodes into BitCode. The base Reader code is [here](../lib/Reader/reader.cpp) 
 and the main entry point is ReaderBase::msilToIR().  From this starting point MSIL is converted into equivalent 
 BitCode.  In organization the reader is made up of a base component that interfaces with the CLR/EE interface 
-and [readerir](https://github.com/dotnet/llilc/blob/master/lib/Reader/readerir.cpp) which is responsible 
+and [readerir](../lib/Reader/readerir.cpp) which is responsible 
 for generating the actual BitCode.  This separation of concerns allows for easier refactoring and simplifies 
 BitCode creation.
 
-####LLVM
+#### LLVM
 
 [LLVM](http://llvm.org/) is a great code generator that supports lots of platforms and CPU targets.  It also has 
 facilities to be used as both a JIT and AOT compiler.  This combination of features, lots of targets, and ability 
-to compile across a spectrum of compile times, attracted us to LLVM.  For our JIT we use the LLVM MCJIT. This 
-infrastructure allows us to use all the different targets supported by the MC infrastructure as a JIT.  This was our 
-quickest path to running code.  We're aware of the ORC JIT infrastructure but as the CoreCLR only notifies the JIT 
-to compile a method one method at a time, we currently would not get any benefit from the particular features of ORC. 
-(We already compile one method per module today and we don't have to do any of the inter module fixups as that is 
-performed by the runtime.)
+to compile across a spectrum of compile times, attracted us to LLVM.  For our JIT we use LLVM's ORC JIT
+infrastructure.
 
 There is a further discussion of how we're modeling the managed code semantics within LLVM in a following 
-[section](##Managed Semantics in LLVM). 
+[section](#managed-semantics-in-llvm).
 
-####IL Transforms
+#### IL Transforms
 
 IL Transforms precondition the incoming MSIL to account for items like delegates, generics, and inter-op thunks. 
 The intent of the transform phases is to flatten and simplify the C# language semantics to allow a more straight 
@@ -80,7 +76,7 @@ forward mapping to BitCode.
 This area is not defined at this point other than to say that we're evaluating what approaches to bring over from 
 Windows.
 
-####Type Based Optimizations
+#### Type Based Optimizations
 
 A number of optimizations can be done on the incoming programs type graph.  The two key ones are tree shaking, and 
 generics sharing. In tree shaking, unused types and fields are removed from the program to reduce code size and improve 
@@ -88,7 +84,7 @@ locality.  For generic sharing, where possible generic method instances are shar
 
 Like the IL transforms this area is not defined.  Further design work is needed for this within the AOT tool.
 
-####Exception Handling Model
+#### Exception Handling Model
 
 The CLR EH model includes features beyond the C++ Exception Handling model.  C# allows try{} and catch(){} clauses like in 
 C++ but also includes finally {} blocks as well.  Additionally there are compiler synthesized exceptions that will be thrown 
@@ -98,7 +94,7 @@ EH can be found [here](https://msdn.microsoft.com/en-us/library/ms173162.aspx). 
 the ECMA spec [here](http://www.ecma-international.org/publications/standards/Ecma-335.htm). 
 In LLILC we will explicitly expand the CLR required checks in to explicit flow, while for the additional clauses, use 
 the funclet design that is emerging in LLVM to support MSVC-compatible EH.  A full description of our EH approach can be 
-found in our documentation [here](https://github.com/dotnet/llilc/blob/master/Documentation/llilc-jit-eh.md).
+found in our documentation [here](llilc-jit-eh.md).
 
 #### Ahead of Time (AOT) Compilation Driver
 
@@ -144,7 +140,7 @@ it's available.
 
 ## Managed Semantics in LLVM
 
-###Managed optimizations
+### Managed optimizations
 
 #### Managed Checks
 CLR semantics includes checks for certain kind of programing faults in an attempt to avoid certain common programmer errors. 
@@ -161,15 +157,15 @@ there are optimizations that will either compute that the required invariant is 
 or can synthesize a check that will precondition a number of accesses/operations.  This language specific optimizations will 
 need to be added to LLVM either through extending current passes or the introduction of new passes.   
 
-###Managed pointers
+### Managed pointers
 
-####Supporting GC via Statepoints
+#### Supporting GC via Statepoints
 Statepoints will be inserted early during bring up to enforce correctness but we plan to switch to a late insertion scheme 
 to gain more benefit from the mid-level optimizer.
 
-####Interior vs base pointers
+#### Interior vs base pointers
 The GC used by the CLR differentiates between reported base pointers and interior pointers (see 
-[Garbage Collection](https://github.com/dotnet/llilc/blob/master/Documentation/llilc-gc.md#interior-pointers) doc for 
+[Garbage Collection](llilc-gc.md#interior-pointers) doc for 
 more details).  In simple terms an interior pointer results from an arithmetic operation on a base pointer if the resulting 
 pointer is still contained within the object being referenced. (Exterior pointers are not supported.) While all pointers can 
 be reported as interior this will increase the overhead of the GC since more checks are required to establish the object 

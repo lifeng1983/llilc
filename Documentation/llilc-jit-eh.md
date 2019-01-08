@@ -1,8 +1,6 @@
-Exception Handling in the LLILC JIT
-========================================
+# Exception Handling in the LLILC JIT
 
-Introduction
-------------
+## Introduction
 
 This document provides a high-level overview of the LLILC jit's processing
 of exception handling constructs in the code it compiles.  It is not a fully
@@ -25,8 +23,7 @@ This document pertains specifically to just-in-time compilation.  Details
 for ahead-of-time compilation would possibly differ.
 
 
-EH Constructs in MSIL
----------------------
+## EH Constructs in MSIL
 
 MSIL exception handling constructs are defined in [ECMA-335 Partitions I, II, and
 III](http://www.ecma-international.org/publications/standards/Ecma-335.htm).
@@ -67,8 +64,7 @@ handlers associated with protected regions being exited before transferring
 control to the `leave` target.
 
 
-Contract with CLR Execution Engine
-----------------------------------
+## Contract with CLR Execution Engine
 
 This section describes the constraints that the Execution Engine imposes on
 the jit (and its codegen) to support exception processing.
@@ -161,8 +157,7 @@ this section may differ for other architectures (particularly x86), where
 unwinding may proceed differently.
 
 
-LLVM IR Model for Exception/Cleanup Flow
-----------------------------------------
+## LLVM IR Model for Exception/Cleanup Flow
 
 Exception handling in LLVM is [documented at llvm.org](http://llvm.org/docs/ExceptionHandling.html).
 Briefly, exceptions may only be raised at [`invoke`
@@ -182,23 +177,19 @@ enclosing handler in the same function).
 There's also some current work in flight to support native Windows EH in
 LLVM, which will be relevant to LLILC due to similarities between the
 requirements imposed by Windows and by the CLR Execution Engine.  [This
-thread on llvmdev](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/79965)
-and [this section of the EH documentation](http://llvm.org/docs/ExceptionHandling.html#c-exception-handling-using-the-windows-runtime)
-provide an overview of the Windows EH work, with more details in RFCs around
-[SEH](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/78776), [C++
-EH](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/81284), and
-[begin/end catch intrinsics](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/81284).
-Briefly, the plan is to outline filters in the front-end, to add intrinsics
-that can be used to create the information needed for the backend to
-generate the EH tables expected by the Windows CRT's personality routine, to
-model exception dispatch with explicit IR through most of compilation, and
-to use the "EH Preparation" pass (which runs after optimization and before
-codegen) to collapse the explicit dispatch and to separate non-filter
-funclets by outlining handlers.
+thread on llvmdev](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/85783)
+describes the most recent proposal.  Briefly, the plan is to outline filters
+in the front-end, to add a few new instructions, some of which can be the
+target of exception edges (as opposed to exception edges always targeting
+`landingpad` instructions), that will describe exception dispatch (i.e. type
+testing and dispatch to the appropriate handler or outer dispatch) in a
+high-level way with enough atomicity to guarantee that backends which need
+the dispatch to be performed by the runtime can report it to the runtime
+without intervening optimizations having obscured/altered it to the point
+that this is not feasible.
 
 
-Potential Sticking Points
--------------------------
+## Potential Sticking Points
 
 There are a number of design points where the .Net Jit/EE have taken a
 different approach than most of the targets that LLVM supports.  The
@@ -216,19 +207,13 @@ annotations to the IR (initially populated from the MSIL EH region
 annotations) and maintaining them throughout compilation, consulting them
 during code-motion to avoid moving code from one region to another and
 during block layout to ensure the required contiguity/separation.  LLVM IR
-does not carry region annotations, so a different approach is required here
-(and in fact, the idea of maintaining such regions in LLVM IR has been
-[discussed and
-rejected](http://article.gmane.org/gmane.comp.compilers.llvm.devel/78958) on
-llvmdev).  The approach [currently being implemented](http://reviews.llvm.org/D7363)
-for Windows C++ EH in LLVM is to outline handlers into separate functions (i.e.
-the funclets), after optimizations and before translation to machine code;
-and to outline filters in the front-end.  The plan for LLILC is to perform
-the same outlining (with filter outlining done in the reader).  The modeling
-of `rethrow` and the [`llvm.eh.begincatch`](http://llvm.org/docs/ExceptionHandling.html#llvm-eh-begincatch)
-and [`llvm.eh.endcatch`](http://llvm.org/docs/ExceptionHandling.html#llvm-eh-endcatch)
-sentinels present before outlining must ensure that they are not reordered
-with respect to each other.
+does not carry region annotations, so a different approach is required here.
+The current proposal for Windows-compatible EH includes explicit instructions
+executed at entry and exit of handlers, from which regions can be inferred
+at EH preparation time (with code duplication used to make regions
+single-entry where required); LLILC will follow this approach.  The modeling
+of `rethrow` and the instruction that ends a catch must ensure that they are
+not reordered with respect to each other.
 
 Traditionally, .Net jits have also laid out each protected region (minus any
 nested handlers inside the protected region) as a contiguous piece of code
@@ -265,12 +250,9 @@ which directs the runtime to invoke the outer handler upon return from the
 inner handler.  LLVM IR provides a `resume` operator that can be used to
 continue propagation out of the current function, but to continue
 propagation to an outer cleanup within the function, the inner cleanup
-typically just branches to the outer cleanup.  The outlining being added to
-support Windows EH in LLVM expects to see this explicit branching to outer
-cleanups, and ends each outlined handler where it jumps to the next outer
-handler, so that the right code will be executed at runtime; LLILC should
-generate this explicit branching in order to be consistent with what the
-llvm optimizer and funclet outliner both expect.
+typically just branches to the outer cleanup.  The new proposal for
+Windows-compatible EH introduces explicit instructions for branching to the
+next outer cleanup, which LLILC will make use of.
 
 ### Handler Selection/Dispatch in Landing Pad vs. Runtime
 Different exceptions raised at one instruction may need to be handled by
@@ -288,19 +270,9 @@ performs the appropriate type tests for catch handlers and invokes filters
 unwinds the stack, invoking finally/fault handlers as appropriate, and
 eventually calling the appropriate catch/filter handler directly.  The
 challenge to representing this in LLVM IR is the need to represent the
-multiple possible destinations of the exception flow.  Changing invoke to
-allow specifying multiple exception continuations (or, somewhat
-equivalently, changing landingpad to allow specifying a link to an outer
-landingpad) would be an invasive change and it would be tricky to get the
-upgrade path right for code expecting the old pattern.  The [plans for LLVM
-Native Windows C++ EH](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/81284/focus=81458)
-are to use the traditional LLVM IR representation, with explicit inlined
-dispatch and branching from inner to outer handlers, thoughout the
-middle-end, and to use the new `llvm.eh.actions` intrinsic representing the
-multiple calls to handlers once the handlers have been outlined.  Adopting
-this approach in LLILC will fit best with LLVM's expectations for IR shape.
-It should also make it easier to adopt native EH lowering for ahead-of-time
-compilation, should that prove desirable.
+multiple possible destinations of the exception flow.  The current proposal
+for Windows-compatible EH acheives this by chaining the landingpad
+replacement instructions to each other, preserving the nesting relationship.
 
 ### Implicit Exceptions and Machine Traps
 In LLVM IR, the only instruction that can raise an exception is `invoke`.
@@ -313,33 +285,19 @@ operators.  Somewhat related, the CLR has traditionally used machine traps
 to actually raise NullReferenceExceptions and DivideByZeroExceptions at
 runtime.  The idea of allowing implicit exceptions in LLVM IR has been
 [discussed on llvmdev](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/71773),
-resulting in consensus opinion that it's best to keep the IR model simpler
-in the absence of compelling performance data.  Accordingly, the plan for
-LLILC is to insert explicit tests and throws in the IR for implicit MSIL
-exceptions, to be lowered to explicit compares and branches, at least
-initially.  This can be revisited when LLILC is in a mature enough state to
-prototype other approaches and gather performance data.
-
-Should this be revisited, the following points should be kept in mind:
- * The choice whether to use implicit or explicit exceptions in the IR can
-   be made somewhat independently of the choice whether to use machine traps
-   or emit explicit tests in the generated machine code; code generation
-   passes could translate from one model to the other.
- * Machine traps may not be as easy to appropriate on other platforms, so
-   generating explicit sequences eases the task of porting the runtime.
- * Keeping both options available (under some configuration option) would
-   therefore be preferable to retiring the explicit sequence generation.
- * Making exceptions implicit in the IR may require adding a top-level
-   landing pad with unconditional `resume`, to enforce precise exception
-   semantics.  An explicit branch to a noreturn function
-   (`CORINFO_HELP_THROW`) enforces those semantics with the explicit model.
-
-Note also that the current MSIL reader code is built to expect an implicit
-model.  E.g. it begins by building a control flow graph with the assumption
-that basic blocks will not be split at implicit exception points.
-Implementing the explicit approach will therefore take some up-front work to
-ferret out bad assumptions in the reader, split blocks at exception points,
-etc.
+resulting in consensus opinion that it's not desirable to conflate the check
+and load/store operations in LLVM IR.  More recently, [an RFC](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/84837)
+has been introduced to allow folding null checks onto loads at the machine IR
+level (after using explicit checks throughout optimization).  Accordingly,
+the plan for LLILC is to insert explicit tests and throws in the IR for
+implicit MSIL exceptions, and run the null check folding pass as an
+optimization on targets that support it.  This allows the null checks and
+loads/stores to be optimized independently, and allows the runtime to be
+ported to new targets without also needing to appropriate machine traps on
+those targets.  This will require extending the null check folding
+optimization (the current plan is to fold away the compare and branch; for
+CoreCLR we also want to fold away the call to the helper that raises the
+NullReferenceException).
 
 ### One-Pass vs. Two-Pass Exception Handling
 LLVM IR is set up to model cleanups that occur en route, working from inner
@@ -355,20 +313,19 @@ caller.  The SEH support currently being added to LLVM expects filters to be
 outlined by the front-end (and support for this outlining has been [added to
 clang](http://reviews.llvm.org/rL226760)).  Similar outlining will need to
 be performed by LLILC.  With this approach, the invocation of the outlined
-filter can conceptually be modeled as part of the execution of the
-beginfinally/beginfault intrinsic that [LLILC will insert](#finally-handlers)
-at the start of each finally/fault handler.
+filter is modeled as an effect of the `invoke` target (the invoke target
+must call an external function to raise an exception, which therefore must
+be conservatively modeled as possibly calling the filter function).
 
 
-Translation from MSIL to LLVM IR in Reader
-------------------------------------------
+## Translation from MSIL to LLVM IR in Reader
 
 This section describes the processing of EH constructs in the MSIL Reader.
 The goal is to translate the MSIL constructs into IR constructs that match
 LLVM's expectations to the greatest degree possible, and to confine special
 semantics to a small number of intrinsics that minimally inhibit
 optimization.  This goal is shared with the [Windows EH support in
-LLVM](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/81284)
+LLVM](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/85783)
 currently being developed, and the plan is to be able to reuse much of that
 implementation for funclet extraction and EH descriptor generation.
 
@@ -389,74 +346,51 @@ exception throwing, at least initially.  See [discussion](#implicit-exceptions-a
 above for details/rationale.
 
 ### Catch Handlers
-Any region protected by a catch handler will have an associated `landingpad`
-that is the target of exception edges.  The caught exception type will be
-included as a catch clause of the `landingpad` instruction.  Explicit code
-will be added to the `landingpad`'s block that uses the standard LLVM IR
-sequence to get the type of exception caught, compare it to the selector
-value defined by the `landingpad` instruction, and conditionally branch to
-either the handler code or the next outer handler (or
-[`resume`](http://llvm.org/docs/LangRef.html#resume-instruction) if there is
-no enclosing outer handler).  This explicit dispatch code will eventually be
-removed by the WinEHPrepare pass that outlines the handler code; its dual
-function is to direct the outliner and to give upstream passes (notably
-optimization) a correct view of the program's semantics.  The handler code
-itself will begin with the [`llvm.eh.begincatch` intrinsic](http://llvm.org/docs/ExceptionHandling.html#llvm-eh-begincatch)
-and end with the [`llvm.eh.endcatch` intrinsic](http://llvm.org/docs/ExceptionHandling.html#llvm-eh-endcatch).
-These intrinsics serve both as sentinels for the later outlining, and to
-prevent illegal code motion into or out of the handler by virtue of their
-write aliases (in particular, they need to interfere with `rethrow`).
+LLILC will translate catch handlers the same way that Clang does when
+targeting native Windows.  The current proposal is to have an `catchblock`
+instruction which is the target of the EH edges within the protected region
+and which models the exception dispatch, branching to the catch handler code
+or to a corresponding `catchend` (which passes control to the next outer
+handler).
 
 ### Finally Handlers
-Any region protected by a finally handler will have an associated
-`landingpad` that is the target of exception edges.  The `landingpad` will
-have a `cleanup` clause.  The code of the finally handler will follow the
-`landingpad`, prefixed by a `beginfinally`.  The `beginfinally` intrinsic
-will model the effects of potentially calling outer filters before invoking
-the finally (Note: LLVM currently does not have a `beginfinally` intrinsic;
-it can be specific to LLILC initially but may be a good candidate to push up
-into llvm).  Control at the end of a finally handler may flow to a number of
-different places (an outer exception handler, or the target of any `leave`
-instruction that crosses the finally handler).  The code used for this
-sequence should match what the LLVM optimizer and funclet outliner
-expect to see; the outliner logic is [still being
-decided](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/82245), and
-Clang [handles SEH `__finally` clauses](http://reviews.llvm.org/rL228222)
-the same way it handles destructor calls when scopes are exited by gotos; by
-manufacturing continuation selector variables that are set by each callsite
-before entering the finally block and then used in explicit compares and
-branches to return control at the end of the finally.  Following suit is the
-plan at least initially in LLILC; after correct functionality is established,
-we can evaluate whether this approach leaves unnecessary cruft in the
-generated code and make revisions if warranted (possibly pushing those
-revisions back up to LLVM).
+Under LLVM's new Windows-compatible EH proposal, a `cleanupblock` instruction
+will be added, which can be used as the target of EH edges within a region
+protected by a finally handler; the end of the handler is marked by a
+corresponding `endcleanup` instruction.
+
+Since a finally can also be entered by normal control flow, LLILC will need
+to support entering a cleanup via non-exception flow, as described in
+[this thread](http://thread.gmane.org/gmane.comp.compilers.llvm.devel/85783/focus=85980).
+Assuming that `endcleanup` takes the form that it has two successors, LLILC
+will need to generate explicit continuation selector variables and an explicit
+switch on the associated selector in the non-EH successor of `endcleanup` if
+the associated finally has more than one label targetd by `leave` instructions
+exiting it.  Folding the continuation selectors back into the funclet
+callsites can be approached as a subsequent optimization.
 
 One performance consideration of note for finally handlers is that jits
 often make a clone of the finally handler for the primary non-exceptional
 path, to allow better optimization (and avoid the overhead of a call at
 runtime) along that path.  This will be considered after initial bring-up.
-It would be legal to remove the `beginfinally` intrinsic call in the
-non-exceptional clone when this is done.
 
 ### Fault Handlers
 Fault handlers will essentially be treated like [finally handlers](#finally-handlers),
 with the exception that the reader will not insert code to enter fault handlers
 during the processing of `leave` instructions (and in general will never
-insert code to enter fault handlers except from landing pads), and therefore
+insert code to enter fault handlers except via exception edges), and therefore
 fault handlers don't need associated continuation selector variables (the end
 of a fault handler will branch unconditionally to the exception continuation).
-It may make sense to use a `beginfault` intrinsic rather than `beginfinally`
-for fault handlers.
 
 ### Filter Handlers
 Filters have a "filter part" and a "handler part".  The "filter part" will
 be outlined at the start of compilation, so that referenced locals can be
-moved to closures and the calls to filters implicit in beginfinally
-intrinsic invocations are a sound representation of the control flow into
-and out of filters.  The "handler part" will be treated similar to a [catch
+moved to closures and the calls to filters implicit in throwing `invoke`
+targets are a sound representation of the control flow into and out of
+filters.  The "handler part" will be treated similar to a [catch
 handler](#catch-handlers), with the difference that, following the LLVM
 convention for SEH, the address of the outlined filter function will appear
-in the landing pad where the type of caught exception appears for catch
+in the `catchblock` where the type of caught exception appears for catch
 handlers.  Additionally, the outlined "filter part" and "handler part" for
 each filter must be placed adjacent to each other (with the "filter part"
 first) when the funclets are laid out.
@@ -466,8 +400,8 @@ Rethrow will be translated similarly to [throw](#explicit-throw), except
 that the call is to `CORINFO_HELP_RETHROW` instead of `CORINFO_HELP_THROW`
 (and the rethrow helper takes no arguments, unlike the throw helper which
 takes a pointer to the exception object to throw).  The aliasing information
-for these calls must interfere with the information on the
-`llvm.eh.begincatch` and `llvm.eh.endcatch` intrinsics.
+for these calls must interfere with the information on the `unwind` and
+`recover` instructions that end catch handlers.
 
 ### Leave
 When a leave instruction is encountered, if it does not exit a
@@ -478,8 +412,7 @@ then branch to the innermost finally handler whose protected region it
 exits.
 
 
-Translation from LLVM IR to EH Tables
--------------------------------------
+## Translation from LLVM IR to EH Tables
 
 The plan for LLILC is to use the LLVM code that is currently being developed
 to support native Windows EH in order to identify the structure of the
@@ -489,8 +422,7 @@ encoded in the two cases is essentially similar, so a mapping should be
 feasible.
 
 
-Staging Plan and Current Status
--------------------------------
+## Staging Plan and Current Status
 
 Full EH support will take a while to implement, and many jit tests don't
 throw exceptions at runtime and therefore don't require full EH support to
@@ -536,7 +468,7 @@ In summary, the plan/status is:
      - [x] Array store checks
  2. [ ] Handler bring-up in EH branch
    - [ ] Catch handler support
-     - [ ] In reader (includes updating throws to use `invoke` rather than
+     - [x] In reader (includes updating throws to use `invoke` rather than
            `call` with EH edge to `landingpad`)
      - [ ] Funclet prolog/epilog generation, Previous Stack Pointer Symbol
            handshake implemented
@@ -545,7 +477,6 @@ In summary, the plan/status is:
    - [ ] Support for `rethrow`
    - [ ] Finally handler support
      - [ ] In reader (includes `leave` processing, continuation selection)
-     - [ ] Beginfinally intrinsic handling
      - [ ] EH Clause generation
    - [ ] Filter handler support
      - [ ] In reader (includes early outlining)
@@ -554,6 +485,7 @@ In summary, the plan/status is:
  3. [ ] Migrate changes back into master branch
  4. [ ] EH-specific optimizations
    - [ ] Finally cloning
+   - [ ] Null check folding
    - [ ] Others TBD
  5. [ ] Support for other target architectures
  6. [ ] Support for ahead-of-time compilation
@@ -562,8 +494,7 @@ In summary, the plan/status is:
 ahead-of-time is TBD, based on future priorities.)
 
 
-Open Questions
---------------
+## Open Questions
 
  1. Can filter outlining leverage some of the same outlining utilities used
     by the late outlining of handlers in LLVM, or is it best performed

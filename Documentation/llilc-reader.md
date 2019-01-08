@@ -1,8 +1,6 @@
-﻿LLILC Reader
-============
+﻿# LLILC Reader
 
-Introduction
-------------
+## Introduction
 
 LLILC reader is part of LLILC JIT and is responsible for translating
 MSIL instructions into LLVM IR.  The semantics of MSIL instructions is
@@ -18,8 +16,7 @@ Engine.  The reader calls methods of that interface to resolve MSIL
 tokens, get information about types, fields, code locations and much
 more.
 
-Main Classes
-------------
+## Main Classes
 
 The two main classes comprising the reader are ReaderBase and GenIR.
 GenIR derives from ReaderBase. ReaderBase encapsulates MSIL processing
@@ -31,8 +28,7 @@ code more maintainable and easier to evolve.  A legacy jit was
 implemented using the same ReaderBase and a different implementation of
 GenIR.
 
-Reader Driver
--------------
+## Reader Driver
 
 The main driver for the reader is ReaderBase::msilToIR.  The driver has
 the steps below:
@@ -56,8 +52,7 @@ the steps below:
 
 -   Execute [Post-pass](#post-pass) to allow the client a chance to finish up
 
-Pre-pass
---------
+## Pre-pass
 
 An instance of GenIR translates a single function.  GenIR::readerPrePass
 is responsible for initial setup.  The steps it performs:
@@ -78,8 +73,7 @@ is responsible for initial setup.  The steps it performs:
 -   Check whether the function has features that the reader hasn’t
     implemented yet
 
-First Pass
-----------
+## First Pass
 
 First pass is responsible for building LLVM basic blocks. The only instructions
 that are inserted are terminating branches and switches. Blocks that end with
@@ -102,8 +96,7 @@ temporary target blocks with the real ones.  This may involve splitting a
 basic block if a target of a branch has offset that’s in the middle of
 the block.
 
-Second Pass
------------
+## Second Pass
 
 In the second pass the reader first walks the flow graph in depth-first preorder
 (starting with the head block) to identify unused blocks.  Then the reader walks
@@ -147,7 +140,7 @@ LLVM Types.
     single LLVM Type: ClassTypeMap and ArrayTypeMap.  ClassTypeMap is
     indexed by CORINFO\_CLASS\_HANDLE and is used for non-array types.
     ArrayTypeMap is indexed by `<element type, element handle, array
-    rank>` tuple.  The reason for that is that two different
+    rank, is vector>` tuple.  The reason for that is that two different
     CORINFO\_CLASS\_HANDLEs can identify the same array: the actual
     array handle and the handle for its MethodTable.
 
@@ -212,29 +205,27 @@ The instructions currently implemented:
 -   Addressing fields (ldfld, ldsfld, ldflda, ldsflda, stfld, stsfld)
 
 -   Manipulating class and value type instances (ldnull, ldstr, newobj,
-    castclass, isinst, ldtoken, sizeof, box)
+    castclass, isinst, ldtoken, sizeof, box, ldobj, stobj, unbox, mkrefany,
+    refanytype, refanyval)
 
 -   Vector instructions (newarr, ldlen)
 
 -   Calls (call, calli, ldftn, ldvirtftn, calls that
-    require virtual stub dispatch)
+    require virtual stub dispatch, constrained virtual calls)
 
 -   Method argument list (arglist)
 
 -   Stack manipulation (nop, dup, pop)
 
-<a name="Not implemented"></a>The instructions not yet implemented:
+-   Block operations (cpblk, initblk)
 
 -   Local block allocation (localloc)
 
--   Block operations (cpblk, initblk).
-
--   Manipulating class and value type instances (ldobj, stobj,
-    unbox, mkrefany, refanytype, refanyval)
-
--   Calls (jmp, tail calls, constrained virtual calls)
-
 -   Debugging breakpoint (break)
+
+<a name="Not implemented"></a>The instructions not yet implemented:
+
+-   Calls (jmp, tail calls)
 
 ### Stack Maintenance
 
@@ -260,23 +251,27 @@ that propagate operand stacks in the order of MSIL offsets.  Note that
 [ECMA-335](http://www.ecma-international.org/publications/files/ECMA-ST/ECMA-335.pdf)
 section III.1.7.5 prohibits non-empty operand stacks on backwards branches.
 
-Post-Pass
----------
+## Post-Pass
 
 The post-pass inserts the necessary code for keeping generic context
 alive and cleans up memory used by the reader.
 
-Future Work
------------
+## Support for Ngen
+
+llilc will be used as a jit for native image generator (Ngen). The tool for generating
+Ngen images in CoreCLR is crossgen.exe. crossgen.exe exposes the same jit interface as
+the execution engine in normal jit compilation. The important difference is that handles
+for strings, methods, etc. returned via jit interface in Ngen scenario are not resolved
+addresses. These handles should be reported back to crossgen via recordRelocation method
+along with the code locations referring to those handles.
+
+## Future Work
 
 -   [Implement remaining MSIL instructions.](#user-content-Not%20implemented)
 
 -   [ReaderBase has some code to enable inlining in the reader. We need
     to decide whether we do inlining in the reader or in a subsequent
     pass and update the reader accordingly.](https://github.com/dotnet/llilc/issues/239)
-
--   [Generate debug locations for later debug emission.](https://github.com/
-    dotnet/llilc/issues/318)
 
 -   Possibly enable a limited set of reader-time optimizations (like
     [avoiding redundant class initialization](https://github.com/dotnet/llilc/issues/38),
@@ -293,8 +288,10 @@ Future Work
 
 -   [Handle methods with security checks.](https://github.com/dotnet/llilc/issues/301)
 
--   [Support union types.](https://github.com/dotnet/llilc/issues/275)
-
--   [Support volatile operations.](https://github.com/dotnet/llilc/issues/278)
-
 -   [Support intrinsics.](https://github.com/dotnet/llilc/issues/281)
+
+-   [NGEN: record relocations via Jit Interface.] (https://github.com/dotnet/llilc/issues/655)
+
+-   [NGEN: verify that we process handle indirections correctly.] (https://github.com/dotnet/llilc/issues/656)
+
+-   [NGEN: GS cookie constant needs to be accessed through an indirection.] (https://github.com/dotnet/llilc/issues/658)

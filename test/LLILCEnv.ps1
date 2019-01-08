@@ -820,49 +820,6 @@ function Global:ApplyFilter([string]$File)
 
 # -------------------------------------------------------------------------
 #
-# Exclude test cases from running
-#
-# -------------------------------------------------------------------------
-
-function Global:ExcludeTest([string]$Arch="x64", [string]$Build="Release")
-{
-  # Excluding Interop\ICastable\Castable*
-  # remove ICastable until it can be debugged
-  pushd $CoreCLRTest\Interop\ICastable
-  del Castable*
-  popd
-
-  # Excluding JIT\CodeGenBringUpTests\div2*,localloc*
-  pushd $CoreCLRTest\JIT\CodeGenBringUpTests
-  del div2*
-  del localloc*
-  popd
-
-  # Excluding JIT\jit64\gc\misc\eh1*,funclet*,fgtest1*,
-  # struct6_5*,struct7_1*,structfpseh5_1*,structfpseh6_1*,
-  # structret6_1*,structret6_2*,structret6_3*
-  pushd $CoreCLRTest\JIT\jit64\gc\misc
-  del eh1*
-  del funclet*
-  del fgtest1*
-  del struct6_5*
-  del struct7_1*
-  del structfpseh5_1*
-  del structfpseh6_1*
-  del structret6_1*
-  del structret6_2*
-  del structret6_3*
-  popd
-
-  # Excluding JIT\jit64\gc\regress\vswhidbey\339415*,143837*
-  pushd $CoreCLRTest\JIT\jit64\gc\regress\vswhidbey
-  del 339415*
-  del 143837*
-  popd
-}
-
-# -------------------------------------------------------------------------
-#
 # Build CoreCLR regression tests
 #
 # -------------------------------------------------------------------------
@@ -871,7 +828,6 @@ function Global:BuildTest([string]$Arch="x64", [string]$Build="Debug")
 {
   pushd $CoreCLRSource\tests
   .\buildtest $Arch $Build clean
-  ExcludeTest $Arch $Build
   popd
 }
 
@@ -921,9 +877,6 @@ function Global:RunTest
   $LLILCTestResult = LLILCTestResult
   $CoreCLRTestTargetBinaries = CoreCLRTestTargetBinaries -Arch $Arch -Build $Build
   
-  # Workaround exception handling issue
-  chcp 65001 | Out-Null
-
   # Reserve the old jit and copy in the specified jit.
   if ($Jit -ne "") {
     #$CoreCLRRuntime = CoreCLRRuntime
@@ -945,7 +898,7 @@ function Global:RunTest
   # Run the test
   pushd .
   cd $CoreCLRSource\tests
-  .\runtest $Arch $Build TestEnv $LLILCTest\LLILCTestEnv.cmd $CoreCLRRuntime | Write-Host
+  .\runtest $Arch $Build Exclude $LLILCTest\exclusion.targets TestEnv $LLILCTest\LLILCTestEnv.cmd $CoreCLRRuntime | Write-Host
   popd
 
   # Restore old value for DUMPLLVMIR
